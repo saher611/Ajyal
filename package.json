@@ -1,7 +1,7 @@
 {
   "name": "ajyal-whatsapp-bot",
   "version": "1.0.0",
-  "description": "WhatsApp to Telegram Bot for Ajyal Council",
+  "description": "WhatsApp and Telegram Bridge for Ajyal",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
