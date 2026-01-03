@@ -1,11 +1,13 @@
 {
-  "name": "ajyal-whatsapp",
+  "name": "ajyal-whatsapp-bot",
   "version": "1.0.0",
+  "description": "WhatsApp to Telegram Bot for Ajyal Council",
   "main": "app.js",
-  "dependencies": {
-    "express": "^4.18.2"
-  },
   "scripts": {
     "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.2"
   }
 }
