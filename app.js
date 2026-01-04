@@ -3,7 +3,7 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 10000;
 const telegramToken = process.env.TELEGRAM_TOKEN;
 const telegramChatId = process.env.TELEGRAM_CHAT_ID;
 const whatsappToken = process.env.WHATSAPP_TOKEN;
@@ -11,20 +11,23 @@ const phoneId = process.env.PHONE_NUMBER_ID;
 
 const replyMap = new Map();
 
-// دالة لجلب رابط الوسائط من واتساب
+// دالة محسنة لجلب رابط الوسائط مع طباعة الأخطاء
 async function getWhatsappMediaUrl(mediaId) {
     try {
         const res = await axios.get(`https://graph.facebook.com/v21.0/${mediaId}`, {
             headers: { 'Authorization': `Bearer ${whatsappToken}` }
         });
-        return res.data.url;
-    } catch (e) { return null; }
+        return res.data.url; 
+    } catch (e) {
+        console.error("❌ فشل جلب رابط الميديا من واتساب:", e.response ? e.response.data : e.message);
+        return null;
+    }
 }
 
 app.post('/', async (req, res) => {
     const body = req.body;
 
-    // 1. من واتساب إلى تليجرام (نص + وسائط)
+    // 1. استقبال من واتساب وتحويل لتليجرام
     if (body.object === 'whatsapp_business_account' && body.entry[0].changes[0].value.messages) {
         const msg = body.entry[0].changes[0].value.messages[0];
         const from = msg.from;
@@ -36,44 +39,63 @@ app.post('/', async (req, res) => {
                     chat_id: telegramChatId,
                     text: `👤 من: ${from}\n💬: ${msg.text.body}`
                 });
-            } else if (['image', 'video', 'document', 'audio'].includes(msg.type)) {
-                const mediaId = msg[msg.type].id;
+            } 
+            // التعامل مع الصور والفيديوهات والملفات
+            else if (['image', 'video', 'document', 'audio'].includes(msg.type)) {
+                const mediaData = msg[msg.type];
+                const mediaId = mediaData.id;
                 const mediaUrl = await getWhatsappMediaUrl(mediaId);
-                const caption = `👤 من: ${from}\n📎 وسائط (${msg.type})`;
                 
-                const method = msg.type === 'image' ? 'sendPhoto' : msg.type === 'video' ? 'sendVideo' : 'sendDocument';
-                telegramMsg = await axios.post(`https://api.telegram.org/bot${telegramToken}/${method}`, {
-                    chat_id: telegramChatId,
-                    [msg.type === 'image' ? 'photo' : msg.type]: mediaUrl,
-                    caption: caption
-                });
+                if (mediaUrl) {
+                    const caption = `👤 من: ${from}\n📎 وسائط (${msg.type})\n${mediaData.caption || ''}`;
+                    const method = msg.type === 'image' ? 'sendPhoto' : msg.type === 'video' ? 'sendVideo' : 'sendDocument';
+                    
+                    telegramMsg = await axios.post(`https://api.telegram.org/bot${telegramToken}/${method}`, {
+                        chat_id: telegramChatId,
+                        [msg.type === 'image' ? 'photo' : msg.type]: mediaUrl,
+                        caption: caption
+                    });
+                } else {
+                    console.error("⚠️ تعذر تحويل الميديا لأن الرابط فارغ");
+                }
             }
-            if (telegramMsg) replyMap.set(telegramMsg.data.result.message_id, from);
-        } catch (e) { console.error("خطأ تحويل لتليجرام"); }
+
+            if (telegramMsg) {
+                replyMap.set(telegramMsg.data.result.message_id, from);
+            }
+        } catch (e) {
+            console.error("❌ خطأ أثناء الإرسال لتليجرام:", e.response ? e.response.data : e.message);
+        }
         return res.sendStatus(200);
     }
 
-    // 2. من تليجرام إلى واتساب (ردود نصية + وسائط)
+    // 2. الرد من تليجرام إلى واتساب
     if (body.message && body.message.reply_to_message) {
         const whatsappRecipient = replyMap.get(body.message.reply_to_message.message_id);
         if (whatsappRecipient) {
             try {
                 if (body.message.text) {
                     await axios.post(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
-                        messaging_product: "whatsapp", to: whatsappRecipient, text: { body: body.message.text }
+                        messaging_product: "whatsapp",
+                        to: whatsappRecipient,
+                        text: { body: body.message.text }
                     }, { headers: { 'Authorization': `Bearer ${whatsappToken}` } });
-                } else if (body.message.photo || body.message.document) {
-                    // ملاحظة: إرسال الوسائط من تليجرام لواتساب يتطلب رفعها أولاً أو استخدام روابط مباشرة
-                    // هنا نرسل إشعاراً للموظف حالياً لضمان استقرار الكود
+                } 
+                else {
                     await axios.post(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
-                        chat_id: telegramChatId, text: "⚠️ إرسال الوسائط من تليجرام لواتساب يتطلب برمجة إضافية للرفع، حالياً الردود النصية فقط مدعومة.",
+                        chat_id: telegramChatId,
+                        text: "⚠️ الردود حالياً مدعومة للنصوص فقط. الوسائط قيد التطوير.",
                         reply_to_message_id: body.message.message_id
                     });
                 }
-            } catch (e) { console.error("خطأ رد واتساب"); }
+            } catch (e) {
+                console.error("❌ خطأ في الرد لواتساب:", e.response ? e.response.data : e.message);
+            }
         }
     }
     res.sendStatus(200);
 });
 
-app.listen(port);
+app.listen(port, () => {
+    console.log(`✅ السيرفر يعمل بنجاح على المنفذ ${port}`);
+});
