@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const FormData = require('form-data');
 const app = express();
 app.use(express.json());
 
@@ -9,24 +10,51 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID;
 const whatsappToken = process.env.WHATSAPP_TOKEN;
 const phoneId = process.env.PHONE_NUMBER_ID;
 
-// ذاكرة لحفظ روابط الرسائل (لتحديث علامات الصح)
-const messageMap = new Map(); 
+const userTopics = new Map(); // ذاكرة المواضيع
+const messageMap = new Map(); // ذاكرة علامات الصح
+
+// دالة إنشاء أو جلب الغرفة (Topic)
+async function getOrCreateTopic(phoneNumber) {
+    if (userTopics.has(phoneNumber)) return userTopics.get(phoneNumber);
+    try {
+        const res = await axios.post(`https://api.telegram.org/bot${telegramToken}/createForumTopic`, {
+            chat_id: telegramChatId,
+            name: `${phoneNumber}` // سيفتحها بالرقم وأنت سمّها كما تشاء
+        });
+        const topicId = res.data.result.message_thread_id;
+        userTopics.set(phoneNumber, topicId);
+        return topicId;
+    } catch (e) { 
+        console.error("❌ فشل إنشاء الغرفة:", e.message);
+        return null; 
+    }
+}
+
+// دالة تحميل الميديا من واتساب
+async function downloadWhatsappMedia(mediaId) {
+    try {
+        const resInfo = await axios.get(`https://graph.facebook.com/v21.0/${mediaId}`, {
+            headers: { 'Authorization': `Bearer ${whatsappToken}` }
+        });
+        const mediaBuffer = await axios.get(resInfo.data.url, {
+            headers: { 'Authorization': `Bearer ${whatsappToken}` },
+            responseType: 'arraybuffer'
+        });
+        return mediaBuffer.data;
+    } catch (e) { return null; }
+}
 
 app.post('/', async (req, res) => {
     const body = req.body;
 
-    // --- أولاً: استقبال تحديثات الحالة (علامات الصح) ---
+    // 1. تحديث علامات الصح (✅، ✅✅، 🔵🔵)
     if (body.entry?.[0]?.changes?.[0]?.value?.statuses) {
         const status = body.entry[0].changes[0].value.statuses[0];
-        const msgId = status.id;
-        const statusType = status.status; // delivered, read, sent
-
-        if (messageMap.has(msgId)) {
-            const { tgChatId, tgMsgId, text } = messageMap.get(msgId);
+        if (messageMap.has(status.id)) {
+            const { tgChatId, tgMsgId, text, threadId } = messageMap.get(status.id);
             let icon = "✅";
-            if (statusType === "delivered") icon = "✅✅";
-            if (statusType === "read") icon = "🔵🔵";
-
+            if (status.status === "delivered") icon = "✅✅";
+            if (status.status === "read") icon = "🔵🔵";
             try {
                 await axios.post(`https://api.telegram.org/bot${telegramToken}/editMessageText`, {
                     chat_id: tgChatId,
@@ -38,64 +66,68 @@ app.post('/', async (req, res) => {
         return res.sendStatus(200);
     }
 
-    // --- ثانياً: استقبال رسالة من الجار (واتساب -> تليجرام) ---
+    // 2. من واتساب إلى تليجرام (إنشاء غرف وإرسال ميديا)
     if (body.object === 'whatsapp_business_account' && body.entry[0].changes[0].value.messages) {
         const msg = body.entry[0].changes[0].value.messages[0];
         const from = msg.from;
-        
-        // البحث عن الغرفة أو إنشاؤها
-        // ملاحظة: نعتمد هنا على الذاكرة المؤقتة أو إنشاء غرفة جديدة بالرقم
-        let topicId = await getOrCreateTopic(from); 
+        const topicId = await getOrCreateTopic(from);
 
-        await axios.post(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
-            chat_id: telegramChatId,
-            message_thread_id: topicId,
-            text: `${msg.text.body}\n\n#ID_${from}`
-        });
+        try {
+            if (msg.type === 'text') {
+                await axios.post(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
+                    chat_id: telegramChatId,
+                    message_thread_id: topicId,
+                    text: `${msg.text.body}\n\n#ID_${from}`
+                });
+            } else if (['image', 'video', 'document'].includes(msg.type)) {
+                const fileData = await downloadWhatsappMedia(msg[msg.type].id);
+                if (fileData) {
+                    const formData = new FormData();
+                    formData.append('chat_id', telegramChatId);
+                    formData.append('message_thread_id', topicId);
+                    formData.append('caption', `📎 وسائط (${msg.type})\n\n#ID_${from}`);
+                    let ext = msg.type === 'image' ? 'jpg' : msg.type === 'video' ? 'mp4' : 'pdf';
+                    let fileName = msg.document?.filename || `file_${Date.now()}.${ext}`;
+                    formData.append(msg.type === 'image' ? 'photo' : (msg.type === 'video' ? 'video' : 'document'), fileData, { filename: fileName });
+                    const method = msg.type === 'image' ? 'sendPhoto' : (msg.type === 'video' ? 'sendVideo' : 'sendDocument');
+                    await axios.post(`https://api.telegram.org/bot${telegramToken}/${method}`, formData, { headers: formData.getHeaders() });
+                }
+            }
+        } catch (e) { console.error("Error sending to TG"); }
         return res.sendStatus(200);
     }
 
-    // --- ثالثاً: الرد المباشر من الغرفة (تليجرام -> واتساب) ---
-    if (body.message && !body.message.from.is_bot) {
+    // 3. الرد المباشر من الغرفة (تليجرام -> واتساب)
+    if (body.message && !body.message.from.is_bot && body.message.chat.id.toString() === telegramChatId.toString()) {
         const threadId = body.message.message_thread_id;
         
-        // جلب معلومات الغرفة لمعرفة الرقم من "العنوان"
-        try {
-            const chatResponse = await axios.get(`https://api.telegram.org/bot${telegramToken}/getForumTopicIconStickers`, {
-                params: { chat_id: telegramChatId }
-            });
-            
-            // استخراج الرقم من اسم الغرفة (يفترض أنك وضعت الرقم في العنوان)
-            // سنستخدم البحث عن الرقم (ID) في الرسائل السابقة كخيار أكثر دقة
-            let recipientNumber = null;
-            if (body.message.reply_to_message) {
-                 const match = (body.message.reply_to_message.text || "").match(/#ID_(\d+)/);
-                 if (match) recipientNumber = match[1];
-            }
+        // البحث عن الـ ID في آخر رسالة بالغرفة
+        let recipientNumber = null;
+        if (body.message.reply_to_message) {
+            const match = (body.message.reply_to_message.text || body.message.reply_to_message.caption || "").match(/#ID_(\d+)/);
+            if (match) recipientNumber = match[1];
+        }
 
-            if (recipientNumber && body.message.text) {
+        if (recipientNumber && body.message.text) {
+            try {
                 const waRes = await axios.post(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
                     messaging_product: "whatsapp",
                     to: recipientNumber,
                     text: { body: body.message.text }
                 }, { headers: { 'Authorization': `Bearer ${whatsappToken}` } });
 
-                // حفظ رقم الرسالة لتحديث علامة الصح لاحقاً
+                // حفظ بيانات الرسالة لتحديث علامة الصح
                 const waMsgId = waRes.data.messages[0].id;
                 messageMap.set(waMsgId, {
                     tgChatId: telegramChatId,
                     tgMsgId: body.message.message_id,
-                    text: body.message.text
+                    text: body.message.text,
+                    threadId: threadId
                 });
-            }
-        } catch (e) { console.error("Error in direct reply"); }
+            } catch (e) { console.error("❌ فشل الرد المباشر"); }
+        }
     }
     res.sendStatus(200);
 });
 
-// دالة مساعدة لإنشاء/جلب المواضيع
-async function getOrCreateTopic(phoneNumber) {
-    // الكود البرمجي المعتاد لإنشاء الـ Topic
-}
-
-app.listen(port, () => console.log(`✅ نظام علامات الصح والرد المباشر جاهز`));
+app.listen(port, () => console.log(`✅ النظام الشامل جاهز يا أبو ريان`));
