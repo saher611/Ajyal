@@ -20,20 +20,21 @@ const GOOGLE_KEY = process.env.GOOGLE_KEY ? process.env.GOOGLE_KEY.replace(/\\n/
 const auth = new google.auth.JWT(GOOGLE_EMAIL, null, GOOGLE_KEY, ['https://www.googleapis.com/auth/spreadsheets']);
 const sheets = google.sheets({ version: 'v4', auth });
 
-// وظيفة لإرسال "تمت القراءة" لواتساب (لتظهر الصحين الزرقاء)
-async function markAsRead(messageId) {
+// وظيفة لجلب رابط الوسيط من واتساب وتحميله
+async function getWhatsAppMedia(mediaId) {
     try {
-        await axios({
-            method: 'POST',
-            url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
-            data: {
-                messaging_product: "whatsapp",
-                status: "read",
-                message_id: messageId
-            },
+        const response = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, {
             headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
         });
-    } catch (e) { console.error("Error marking read:", e.message); }
+        const fileRes = await axios.get(response.data.url, {
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+            responseType: 'arraybuffer'
+        });
+        return fileRes.data;
+    } catch (e) {
+        console.error("خطأ في تحميل الوسائط:", e.message);
+        return null;
+    }
 }
 
 async function getOrCreateTopic(phone) {
@@ -42,10 +43,8 @@ async function getOrCreateTopic(phone) {
         const rows = res.data.values || [];
         const existing = rows.find(row => row[0] == phone);
         if (existing) return existing[1];
-
         const topic = await bot.telegram.createForumTopic(TELEGRAM_CHAT_ID, `الجار: ${phone}`);
         const topicId = topic.message_thread_id;
-
         await sheets.spreadsheets.values.append({
             spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B',
             valueInputOption: 'USER_ENTERED',
@@ -58,18 +57,36 @@ async function getOrCreateTopic(phone) {
 app.post('/webhook', async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
+    
     if (message) {
         const phone = message.from;
-        const text = message.text?.body || "رسالة جديدة";
-        const messageId = message.id;
-
         const topicId = await getOrCreateTopic(phone);
-        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${text}`, { 
-            message_thread_id: topicId || undefined 
-        });
+        const options = { message_thread_id: topicId || undefined };
 
-        // تفعيل الصحين الزرقاء فوراً
-        await markAsRead(messageId);
+        // التعامل مع النصوص
+        if (message.text) {
+            await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${message.text.body}`, options);
+        } 
+        // التعامل مع الصور
+        else if (message.image) {
+            const buffer = await getWhatsAppMedia(message.image.id);
+            if (buffer) await bot.telegram.sendPhoto(TELEGRAM_CHAT_ID, { source: buffer }, { ...options, caption: `🖼 صورة من ${phone}` });
+        }
+        // التعامل مع الفيديو
+        else if (message.video) {
+            const buffer = await getWhatsAppMedia(message.video.id);
+            if (buffer) await bot.telegram.sendVideo(TELEGRAM_CHAT_ID, { source: buffer }, { ...options, caption: `📹 فيديو من ${phone}` });
+        }
+        // التعامل مع الملفات والمستندات
+        else if (message.document) {
+            const buffer = await getWhatsAppMedia(message.document.id);
+            if (buffer) await bot.telegram.sendDocument(TELEGRAM_CHAT_ID, { source: buffer, filename: message.document.filename }, { ...options, caption: `📄 ملف من ${phone}` });
+        }
+        // التعامل مع الرسائل الصوتية
+        else if (message.audio) {
+            const buffer = await getWhatsAppMedia(message.audio.id);
+            if (buffer) await bot.telegram.sendVoice(TELEGRAM_CHAT_ID, { source: buffer }, options);
+        }
     }
     res.sendStatus(200);
 });
@@ -82,18 +99,9 @@ bot.on('message', async (ctx) => {
             const rows = res.data.values || [];
             const match = rows.find(row => row[1] == topicId.toString());
             if (match) {
-                await axios({
-                    method: 'POST',
-                    url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
-                    data: {
-                        messaging_product: "whatsapp",
-                        recipient_type: "individual",
-                        to: match[0],
-                        type: "text",
-                        text: { body: ctx.message.text }
-                    },
-                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-                });
+                await axios.post(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+                    messaging_product: "whatsapp", to: match[0], type: "text", text: { body: ctx.message.text }
+                }, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
             }
         } catch (e) { console.error("Send Error:", e.message); }
     }
@@ -105,7 +113,4 @@ app.get('/webhook', (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log("Ajyal System Pro Online ✅");
-    bot.launch();
-});
+app.listen(PORT, () => { bot.launch(); console.log("Ajyal System Pro Online ✅"); });
