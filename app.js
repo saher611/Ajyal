@@ -20,35 +20,23 @@ const GOOGLE_KEY = process.env.GOOGLE_KEY ? process.env.GOOGLE_KEY.replace(/\\n/
 const auth = new google.auth.JWT(GOOGLE_EMAIL, null, GOOGLE_KEY, ['https://www.googleapis.com/auth/spreadsheets']);
 const sheets = google.sheets({ version: 'v4', auth });
 
-// دالة لتفعيل الصحين الزرقاء (قراءة الرسالة)
+// وظيفة الصحين الزرقاء - محسنة
 async function markAsRead(messageId) {
     try {
         await axios({
             method: 'POST',
             url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
-            data: {
-                messaging_product: "whatsapp",
-                status: "read",
-                message_id: messageId
-            },
-            headers: { 
-                'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-                'Content-Type': 'application/json'
-            }
+            data: { messaging_product: "whatsapp", status: "read", message_id: messageId },
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' }
         });
+        console.log("✅ تمت القراءة (الصحين الزرقاء)");
     } catch (e) { console.error("Error marking read:", e.response?.data || e.message); }
 }
 
-// دالة تحميل الوسائط من واتساب
 async function getWhatsAppMedia(mediaId) {
     try {
-        const response = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, {
-            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-        });
-        const fileRes = await axios.get(response.data.url, {
-            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
-            responseType: 'arraybuffer'
-        });
+        const response = await axios.get(`https://graph.facebook.com/v20.0/${mediaId}`, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
+        const fileRes = await axios.get(response.data.url, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }, responseType: 'arraybuffer' });
         return fileRes.data;
     } catch (e) { return null; }
 }
@@ -61,11 +49,7 @@ async function getOrCreateTopic(phone) {
         if (existing) return existing[1];
         const topic = await bot.telegram.createForumTopic(TELEGRAM_CHAT_ID, `الجار: ${phone}`);
         const topicId = topic.message_thread_id;
-        await sheets.spreadsheets.values.append({
-            spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B',
-            valueInputOption: 'USER_ENTERED',
-            resource: { values: [[phone, topicId]] }
-        });
+        await sheets.spreadsheets.values.append({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B', valueInputOption: 'USER_ENTERED', resource: { values: [[phone, topicId]] } });
         return topicId;
     } catch (e) { return null; }
 }
@@ -73,39 +57,29 @@ async function getOrCreateTopic(phone) {
 app.post('/webhook', async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
-    
     if (message) {
         const phone = message.from;
-        const messageId = message.id; // نحتاج الـ ID لتفعيل الصحين
+        const messageId = message.id;
         const topicId = await getOrCreateTopic(phone);
         const options = { message_thread_id: topicId || undefined };
 
-        // 1. معالجة النصوص
         if (message.text) {
             await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${message.text.body}`, options);
-        } 
-        // 2. معالجة الصور
-        else if (message.image) {
+        } else if (message.image) {
             const buffer = await getWhatsAppMedia(message.image.id);
             if (buffer) await bot.telegram.sendPhoto(TELEGRAM_CHAT_ID, { source: buffer }, { ...options, caption: `🖼 صورة من ${phone}` });
-        }
-        // 3. معالجة الفيديو
-        else if (message.video) {
+        } else if (message.video) {
             const buffer = await getWhatsAppMedia(message.video.id);
             if (buffer) await bot.telegram.sendVideo(TELEGRAM_CHAT_ID, { source: buffer }, { ...options, caption: `📹 فيديو من ${phone}` });
-        }
-        // 4. معالجة المستندات
-        else if (message.document) {
+        } else if (message.document) {
             const buffer = await getWhatsAppMedia(message.document.id);
             if (buffer) await bot.telegram.sendDocument(TELEGRAM_CHAT_ID, { source: buffer, filename: message.document.filename }, { ...options, caption: `📄 ملف من ${phone}` });
-        }
-        // 5. معالجة الصوت
-        else if (message.audio) {
+        } else if (message.audio) {
             const buffer = await getWhatsAppMedia(message.audio.id);
             if (buffer) await bot.telegram.sendVoice(TELEGRAM_CHAT_ID, { source: buffer }, options);
         }
 
-        // تفعيل الصحين الزرقاء فوراً بعد التوجيه لتليجرام
+        // تفعيل الصحين الزرقاء فوراً
         await markAsRead(messageId);
     }
     res.sendStatus(200);
@@ -122,13 +96,7 @@ bot.on('message', async (ctx) => {
                 await axios({
                     method: 'POST',
                     url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
-                    data: {
-                        messaging_product: "whatsapp",
-                        recipient_type: "individual",
-                        to: match[0],
-                        type: "text",
-                        text: { body: ctx.message.text }
-                    },
+                    data: { messaging_product: "whatsapp", recipient_type: "individual", to: match[0], type: "text", text: { body: ctx.message.text } },
                     headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
                 });
             }
@@ -144,5 +112,5 @@ app.get('/webhook', (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log("Ajyal System Pro Online ✅");
-    bot.launch().catch(err => console.error("Telegram Conflict:", err.message));
+    bot.launch();
 });
