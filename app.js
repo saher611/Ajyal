@@ -6,7 +6,6 @@ const { google } = require('googleapis');
 const app = express();
 app.use(express.json());
 
-// جلب الإعدادات من Render
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
@@ -21,7 +20,6 @@ const GOOGLE_KEY = process.env.GOOGLE_KEY ? process.env.GOOGLE_KEY.replace(/\\n/
 const auth = new google.auth.JWT(GOOGLE_EMAIL, null, GOOGLE_KEY, ['https://www.googleapis.com/auth/spreadsheets']);
 const sheets = google.sheets({ version: 'v4', auth });
 
-// دالة لجلب أو إنشاء توبيك وتسجيله في الجدول
 async function getOrCreateTopic(phone) {
     try {
         const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B' });
@@ -29,11 +27,9 @@ async function getOrCreateTopic(phone) {
         const existing = rows.find(row => row[0] == phone);
         if (existing) return existing[1];
 
-        // إذا الجار جديد، نفتح له توبيك (تأكد أن البوت Admin في القروب)
         const topic = await bot.telegram.createForumTopic(TELEGRAM_CHAT_ID, `الجار: ${phone}`);
         const topicId = topic.message_thread_id;
 
-        // تسجيل البيانات في Sheet1
         await sheets.spreadsheets.values.append({
             spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B',
             valueInputOption: 'USER_ENTERED',
@@ -41,18 +37,17 @@ async function getOrCreateTopic(phone) {
         });
         return topicId;
     } catch (e) {
-        console.error("خطأ في الجدول أو التوبيك:", e.message);
-        return null; 
+        console.error("Sheet/Topic Error:", e.message);
+        return null;
     }
 }
 
-// 1. استقبال من واتساب وإرسال لتليجرام
 app.post('/webhook', async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
     if (message) {
         const phone = message.from;
-        const text = message.text?.body || "رسالة غير نصية";
+        const text = message.text?.body || "رسالة جديدة";
         const topicId = await getOrCreateTopic(phone);
         await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${text}`, { 
             message_thread_id: topicId || undefined 
@@ -61,21 +56,35 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
-// 2. الرد من تليجرام لواتساب
 bot.on('message', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
-    const replyText = ctx.message.text;
-    if (topicId && replyText) {
+    if (topicId && ctx.message.text) {
         try {
             const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B' });
             const rows = res.data.values || [];
             const match = rows.find(row => row[1] == topicId.toString());
             if (match) {
-                await axios.post(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
-                    messaging_product: "whatsapp", to: match[0], type: "text", text: { body: replyText }
-                }, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
+                // تعديل: إضافة الـ headers والـ messaging_product بشكل صحيح لتجنب خطأ 400
+                await axios({
+                    method: 'POST',
+                    url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+                    data: {
+                        messaging_product: "whatsapp",
+                        recipient_type: "individual",
+                        to: match[0],
+                        type: "text",
+                        text: { body: ctx.message.text }
+                    },
+                    headers: { 
+                        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+                console.log(`✅ تم إرسال الرد إلى ${match[0]}`);
             }
-        } catch (e) { console.error("فشل إرسال الرد لواتساب:", e.message); }
+        } catch (e) { 
+            console.error("فشل إرسال الرد لواتساب:", e.response?.data || e.message); 
+        }
     }
 });
 
@@ -87,5 +96,5 @@ app.get('/webhook', (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log("Ajyal System Pro Online ✅");
-    bot.launch().catch(err => console.error("فشل تشغيل بوت تليجرام:", err.message));
+    bot.launch();
 });
