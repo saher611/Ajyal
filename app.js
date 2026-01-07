@@ -10,9 +10,11 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID;
 const whatsappToken = process.env.WHATSAPP_TOKEN;
 const phoneId = process.env.PHONE_NUMBER_ID;
 
+// ذاكرة الحفظ
 const userTopics = new Map(); 
 const messageMap = new Map(); 
 
+// 1. دالة إنشاء الغرف (تم وضعها هنا لضمان التشغيل)
 async function getOrCreateTopic(phoneNumber) {
     if (userTopics.has(phoneNumber)) return userTopics.get(phoneNumber);
     try {
@@ -23,9 +25,13 @@ async function getOrCreateTopic(phoneNumber) {
         const topicId = res.data.result.message_thread_id;
         userTopics.set(phoneNumber, topicId);
         return topicId;
-    } catch (e) { return null; }
+    } catch (e) {
+        console.error("❌ فشل إنشاء الموضوع:", e.message);
+        return null;
+    }
 }
 
+// 2. دالة تحميل الميديا
 async function downloadWhatsappMedia(mediaId) {
     try {
         const resInfo = await axios.get(`https://graph.facebook.com/v21.0/${mediaId}`, {
@@ -42,7 +48,7 @@ async function downloadWhatsappMedia(mediaId) {
 app.post('/', async (req, res) => {
     const body = req.body;
 
-    // 1. علامات الصح
+    // --- تحديث علامات الصح ---
     if (body.entry?.[0]?.changes?.[0]?.value?.statuses) {
         const status = body.entry[0].changes[0].value.statuses[0];
         if (messageMap.has(status.id)) {
@@ -59,10 +65,12 @@ app.post('/', async (req, res) => {
         return res.sendStatus(200);
     }
 
-    // 2. من واتساب لتليجرام
+    // --- استقبال من واتساب ---
     if (body.object === 'whatsapp_business_account' && body.entry[0].changes[0].value.messages) {
         const msg = body.entry[0].changes[0].value.messages[0];
         const from = msg.from;
+        
+        // استدعاء الدالة لفتح الغرفة
         const topicId = await getOrCreateTopic(from);
 
         if (msg.type === 'text') {
@@ -86,45 +94,38 @@ app.post('/', async (req, res) => {
         return res.sendStatus(200);
     }
 
-    // 3. الرد المباشر (المحسن)
+    // --- الرد المباشر ---
     if (body.message && !body.message.from.is_bot && body.message.chat.id.toString() === telegramChatId.toString()) {
         const threadId = body.message.message_thread_id;
         if (!threadId) return res.sendStatus(200);
 
         let recipientNumber = null;
-        // البحث عن الرقم في الذاكرة
         for (let [num, id] of userTopics.entries()) {
             if (id.toString() === threadId.toString()) { recipientNumber = num; break; }
         }
 
-        // إذا لم يجد في الذاكرة، يبحث عن ID في الرسالة السابقة (بدون اشتراط ريبلاي يدوي)
-        if (!recipientNumber) {
-            try {
-                const history = await axios.get(`https://api.telegram.org/bot${telegramToken}/getUpdates`);
-                // منطق بديل: البحث عن أي رسالة سابقة في هذا الـ Thread تحتوي على #ID_
-                // للتبسيط، نطلب من المستخدم عمل ريبلاي مرة واحدة فقط عند إعادة تشغيل السيرفر
-                if (body.message.reply_to_message) {
-                    const match = (body.message.reply_to_message.text || body.message.reply_to_message.caption || "").match(/#ID_(\d+)/);
-                    if (match) recipientNumber = match[1];
-                }
-            } catch(e) {}
+        if (!recipientNumber && body.message.reply_to_message) {
+            const match = (body.message.reply_to_message.text || body.message.reply_to_message.caption || "").match(/#ID_(\d+)/);
+            if (match) recipientNumber = match[1];
         }
 
         if (recipientNumber && body.message.text) {
-            const waRes = await axios.post(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
-                messaging_product: "whatsapp",
-                to: recipientNumber,
-                text: { body: body.message.text }
-            }, { headers: { 'Authorization': `Bearer ${whatsappToken}` } });
+            try {
+                const waRes = await axios.post(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
+                    messaging_product: "whatsapp",
+                    to: recipientNumber,
+                    text: { body: body.message.text }
+                }, { headers: { 'Authorization': `Bearer ${whatsappToken}` } });
 
-            messageMap.set(waRes.data.messages[0].id, {
-                tgChatId: telegramChatId,
-                tgMsgId: body.message.message_id,
-                text: body.message.text
-            });
+                messageMap.set(waRes.data.messages[0].id, {
+                    tgChatId: telegramChatId,
+                    tgMsgId: body.message.message_id,
+                    text: body.message.text
+                });
+            } catch (e) {}
         }
     }
     res.sendStatus(200);
 });
 
-app.listen(port, () => console.log(`✅ النظام شغال يا أبو ريان`));
+app.listen(port, () => console.log(`✅ النظام المحدث شغال يا أبو ريان`));
