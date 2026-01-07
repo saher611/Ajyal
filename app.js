@@ -6,8 +6,7 @@ const { google } = require('googleapis');
 const app = express();
 app.use(express.json());
 
-// --- الربط مع خزنة Render (Environment Variables) ---
-// الكود سيسحب التوكن والمفتاح تلقائياً من الخانات التي ملأتها في Render
+// سحب البيانات من إعدادات Render (خزنة الأسرار)
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const GOOGLE_EMAIL = process.env.GOOGLE_EMAIL;
 const GOOGLE_KEY = process.env.GOOGLE_KEY ? process.env.GOOGLE_KEY.replace(/\\n/g, '\n') : undefined;
@@ -18,11 +17,10 @@ const ULTRAMSG_TOKEN = '689f9euh50m2l8d1';
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
 
-// إعداد جوجل باستخدام البيانات المسحوبة من Render
 const auth = new google.auth.JWT(GOOGLE_EMAIL, null, GOOGLE_KEY, ['https://www.googleapis.com/auth/spreadsheets']);
 const sheets = google.sheets({ version: 'v4', auth });
 
-// جلب الهاتف من الجدول بناءً على رقم التوبيك
+// وظيفة جلب الهاتف من جدول جوجل
 async function getPhoneFromSheet(topicId) {
     try {
         const res = await sheets.spreadsheets.values.get({
@@ -32,13 +30,10 @@ async function getPhoneFromSheet(topicId) {
         if (!rows) return null;
         const match = rows.reverse().find(row => row[0] == topicId.toString());
         return match ? match[1] : null;
-    } catch (e) { 
-        console.error("خطأ في قراءة الجدول:", e.message);
-        return null; 
-    }
+    } catch (e) { return null; }
 }
 
-// استقبال ردودك من تليجرام وإرسالها لواتساب
+// الرد من تليجرام إلى واتساب
 bot.on('message', async (ctx) => {
     try {
         const topicId = ctx.message.message_thread_id;
@@ -48,22 +43,23 @@ bot.on('message', async (ctx) => {
                 await axios.post(`https://api.ultramsg.com/${ULTRAMSG_INSTANCE}/messages/chat`, {
                     token: ULTRAMSG_TOKEN, to: phone, body: ctx.message.text
                 });
-                await ctx.reply("✅ تم الإرسال للجار");
+                await ctx.reply("✅ تم إرسال الرد للجار عبر واتساب");
             }
         }
-    } catch (e) { console.error("Error sending to WhatsApp:", e.message); }
+    } catch (e) { console.error("WhatsApp Send Error:", e.message); }
 });
 
-app.get('/', (req, res) => res.send('System Online - Secure Mode ✅'));
+app.get('/', (req, res) => res.send('Ajyal Bot is Secure & Online! ✅'));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    if (TELEGRAM_TOKEN) {
-        bot.launch()
-            .then(() => console.log("Telegram Bot Started ✅"))
-            .catch(err => console.error("Bot fail:", err.message));
-    } else {
-        console.error("خطأ: TELEGRAM_TOKEN غير موجود في إعدادات Render!");
+app.listen(PORT, async () => {
+    console.log(`Server is running on port ${PORT}`);
+    try {
+        // حذف أي جلسة قديمة لتجنب خطأ 409 Conflict
+        await axios.get(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/deleteWebhook?drop_pending_updates=true`);
+        bot.launch();
+        console.log("Telegram Bot Connected ✅ - البوت يعمل الآن بنجاح");
+    } catch (err) {
+        console.error("Connection Error:", err.message);
     }
 });
