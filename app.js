@@ -20,6 +20,22 @@ const GOOGLE_KEY = process.env.GOOGLE_KEY ? process.env.GOOGLE_KEY.replace(/\\n/
 const auth = new google.auth.JWT(GOOGLE_EMAIL, null, GOOGLE_KEY, ['https://www.googleapis.com/auth/spreadsheets']);
 const sheets = google.sheets({ version: 'v4', auth });
 
+// وظيفة لإرسال "تمت القراءة" لواتساب (لتظهر الصحين الزرقاء)
+async function markAsRead(messageId) {
+    try {
+        await axios({
+            method: 'POST',
+            url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+            data: {
+                messaging_product: "whatsapp",
+                status: "read",
+                message_id: messageId
+            },
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+        });
+    } catch (e) { console.error("Error marking read:", e.message); }
+}
+
 async function getOrCreateTopic(phone) {
     try {
         const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B' });
@@ -36,10 +52,7 @@ async function getOrCreateTopic(phone) {
             resource: { values: [[phone, topicId]] }
         });
         return topicId;
-    } catch (e) {
-        console.error("Sheet/Topic Error:", e.message);
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 app.post('/webhook', async (req, res) => {
@@ -48,10 +61,15 @@ app.post('/webhook', async (req, res) => {
     if (message) {
         const phone = message.from;
         const text = message.text?.body || "رسالة جديدة";
+        const messageId = message.id;
+
         const topicId = await getOrCreateTopic(phone);
         await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${text}`, { 
             message_thread_id: topicId || undefined 
         });
+
+        // تفعيل الصحين الزرقاء فوراً
+        await markAsRead(messageId);
     }
     res.sendStatus(200);
 });
@@ -64,7 +82,6 @@ bot.on('message', async (ctx) => {
             const rows = res.data.values || [];
             const match = rows.find(row => row[1] == topicId.toString());
             if (match) {
-                // تعديل: إضافة الـ headers والـ messaging_product بشكل صحيح لتجنب خطأ 400
                 await axios({
                     method: 'POST',
                     url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
@@ -75,16 +92,10 @@ bot.on('message', async (ctx) => {
                         type: "text",
                         text: { body: ctx.message.text }
                     },
-                    headers: { 
-                        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-                        'Content-Type': 'application/json'
-                    }
+                    headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
                 });
-                console.log(`✅ تم إرسال الرد إلى ${match[0]}`);
             }
-        } catch (e) { 
-            console.error("فشل إرسال الرد لواتساب:", e.response?.data || e.message); 
-        }
+        } catch (e) { console.error("Send Error:", e.message); }
     }
 });
 
