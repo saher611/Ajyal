@@ -92,6 +92,38 @@ async function getPhoneByTopicId(topicId) {
     return null;
 }
 
+async function ensureMapping(phone, topicId) {
+    const normalizedPhone = normalizePhone(phone);
+    const normalizedTopicId = topicId?.toString();
+    if (!normalizedPhone || !normalizedTopicId) return false;
+
+    const existingTopicId = await fetchTopicFromSheet(normalizedPhone);
+    if (existingTopicId && existingTopicId !== normalizedTopicId) {
+        cacheMapping(normalizedPhone, existingTopicId);
+        return false;
+    }
+
+    const existingPhone = await getPhoneByTopicId(normalizedTopicId);
+    if (existingPhone && existingPhone !== normalizedPhone) {
+        cacheMapping(existingPhone, normalizedTopicId);
+        return false;
+    }
+
+    if (!existingTopicId && !existingPhone) {
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Sheet1!A:B',
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[normalizedPhone, normalizedTopicId]] }
+        });
+        cacheMapping(normalizedPhone, normalizedTopicId);
+        return true;
+    }
+
+    cacheMapping(normalizedPhone, normalizedTopicId);
+    return true;
+}
+
 async function getOrCreateTopic(phone) {
     const normalizedPhone = normalizePhone(phone);
     if (!normalizedPhone) return null;
@@ -167,10 +199,114 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
+bot.command('new', async (ctx) => {
+    const raw = ctx.message.text.replace('/new', '').trim();
+    const phone = normalizePhone(raw);
+    if (!phone) {
+        await ctx.reply('اكتب الرقم بعد الأمر مثل: /new 9665xxxxxxx');
+        return;
+    }
+    try {
+        const topicId = await getOrCreateTopic(phone);
+        if (!topicId) {
+            await ctx.reply('تعذر إنشاء غرفة للرقم.');
+            return;
+        }
+        await ensureMapping(phone, topicId);
+        await bot.telegram.sendMessage(
+            TELEGRAM_CHAT_ID,
+            `✅ تم إنشاء غرفة وربط الرقم ${phone}. اكتب رسالتك هنا لإرسالها للواتساب.`,
+            { message_thread_id: topicId }
+        );
+        await ctx.reply(`تم إنشاء غرفة للرقم ${phone}.`);
+    } catch (e) {
+        console.error('New Topic Error:', e.response?.data || e.message);
+        await ctx.reply('تعذر إنشاء غرفة للرقم.');
+    }
+});
+
+bot.command('bulk', async (ctx) => {
+    const payload = ctx.message.text.replace('/bulk', '').trim();
+    if (!payload) {
+        await ctx.reply('استخدم الأمر بهذا الشكل:\n/bulk نص الرسالة\n9665xxxxxxx\n9665yyyyyyy\nأو\n/bulk 9665xxxxxxx,9665yyyyyyy | نص الرسالة');
+        return;
+    }
+
+    let message = '';
+    let numbers = [];
+
+    if (payload.includes('|')) {
+        const [numbersPart, messagePart] = payload.split('|');
+        message = messagePart?.trim();
+        numbers = numbersPart
+            .split(/[,\n]/)
+            .map(item => normalizePhone(item))
+            .filter(Boolean);
+    } else {
+        const lines = payload.split('\n').map(line => line.trim()).filter(Boolean);
+        message = lines.shift() || '';
+        numbers = lines
+            .join(',')
+            .split(/[,\s]+/)
+            .map(item => normalizePhone(item))
+            .filter(Boolean);
+    }
+
+    if (!message) {
+        await ctx.reply('اكتب نص الرسالة بعد الأمر أو بعد علامة |');
+        return;
+    }
+
+    if (!numbers.length) {
+        await ctx.reply('لم يتم العثور على أرقام صحيحة.');
+        return;
+    }
+
+    let success = 0;
+    let failed = 0;
+
+    for (const phone of numbers) {
+        try {
+            const topicId = await getOrCreateTopic(phone);
+            if (topicId) {
+                await ensureMapping(phone, topicId);
+            }
+            await axios({
+                method: 'POST',
+                url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+                data: { messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, type: 'text', text: { body: message } },
+                headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+            });
+            success += 1;
+        } catch (e) {
+            failed += 1;
+            console.error('Bulk Send Error:', e.response?.data || e.message);
+        }
+    }
+
+    await ctx.reply(`تم إرسال ${success} رسالة. فشل ${failed}.`);
+});
+
 bot.on('message', async (ctx) => {
     const topicId = ctx.message.message_thread_id?.toString();
     if (topicId && ctx.message.text) {
         try {
+            const text = ctx.message.text.trim();
+            if (text.startsWith('/to ')) {
+                const phone = normalizePhone(text.replace('/to', '').trim());
+                if (!phone) {
+                    await ctx.reply('اكتب الرقم بعد الأمر مثل: /to 9665xxxxxxx');
+                    return;
+                }
+                const mapped = await ensureMapping(phone, topicId);
+                if (mapped) {
+                    await ctx.reply(`تم ربط هذه الغرفة بالرقم ${phone}.`);
+                } else {
+                    await ctx.reply('تعذر ربط الرقم (قد يكون مربوطاً مسبقاً).');
+                }
+                return;
+            }
+
             const phone = await getPhoneByTopicId(topicId);
             if (phone) {
                 await axios({
@@ -179,6 +315,8 @@ bot.on('message', async (ctx) => {
                     data: { messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, type: 'text', text: { body: ctx.message.text } },
                     headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
                 });
+            } else {
+                await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم الأمر /to 9665xxxxxxx للربط.');
             }
         } catch (e) {
             console.error('Send Error:', e.response?.data || e.message);
