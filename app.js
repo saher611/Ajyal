@@ -58,6 +58,20 @@ const shouldUseTemplate = (errorData) => {
     return code === 131047 || message.includes('template') || message.includes('outside the allowed window');
 };
 
+const formatWhatsAppError = (errorData, status) => {
+    if (!errorData) return `HTTP ${status || 'unknown'}`;
+    const code = errorData?.error?.code;
+    const message = errorData?.error?.message;
+    const details = errorData?.error?.error_data?.details;
+    const fbtrace = errorData?.error?.fbtrace_id;
+    const parts = [];
+    if (code) parts.push(`code=${code}`);
+    if (message) parts.push(`message=${message}`);
+    if (details) parts.push(`details=${details}`);
+    if (fbtrace) parts.push(`trace=${fbtrace}`);
+    return parts.length ? parts.join(' | ') : `HTTP ${status || 'unknown'}`;
+};
+
 async function sendWhatsAppText(phone, body, attempt = 1) {
     try {
         const response = await axios({
@@ -76,7 +90,7 @@ async function sendWhatsAppText(phone, body, attempt = 1) {
             await sleep(400);
             return sendWhatsAppText(phone, body, attempt + 1);
         }
-        return { ok: false, status, errorData };
+        return { ok: false, status, errorData, errorMessage: formatWhatsAppError(errorData, status) };
     }
 }
 
@@ -112,7 +126,7 @@ async function sendWhatsAppTemplateWithText(phone, bodyText) {
         const status = e.response?.status;
         const errorData = e.response?.data;
         console.error('WhatsApp Template Error:', status, errorData || e.message);
-        return { ok: false, status, errorData };
+        return { ok: false, status, errorData, errorMessage: formatWhatsAppError(errorData, status) };
     }
 }
 
@@ -551,7 +565,7 @@ bot.command('bulk', async (ctx) => {
             await sendToTelegramTopic(phone, (topicThreadId) => (
                 bot.telegram.sendMessage(
                     TELEGRAM_CHAT_ID,
-                    `📣 رسالة جماعية:\n${message}\n\nالحالة: ${result.ok ? '✅ تم الإرسال' : '❌ فشل الإرسال'}${result.usedTemplate ? '\nتم الإرسال عبر قالب موافقة.' : ''}`,
+                    `📣 رسالة جماعية:\n${message}\n\nالحالة: ${result.ok ? '✅ تم الإرسال' : '❌ فشل الإرسال'}${result.usedTemplate ? '\nتم الإرسال عبر قالب موافقة.' : ''}${!result.ok && result.errorMessage ? `\nالسبب: ${result.errorMessage}` : ''}`,
                     { message_thread_id: topicThreadId }
                 )
             ));
@@ -563,7 +577,7 @@ bot.command('bulk', async (ctx) => {
                 await sendToTelegramTopic(phone, (topicThreadId) => (
                     bot.telegram.sendMessage(
                         TELEGRAM_CHAT_ID,
-                        `📣 رسالة جماعية:\n${message}\n\nالحالة: ❌ فشل الإرسال`,
+                        `📣 رسالة جماعية:\n${message}\n\nالحالة: ❌ فشل الإرسال\nالسبب: ${e.response?.data?.error?.message || e.message}`,
                         { message_thread_id: topicThreadId }
                     )
                 ));
@@ -607,7 +621,8 @@ bot.on('message', async (ctx) => {
                 if (result.ok) {
                     await ctx.reply(`✅ تم إرسال الرسالة.${result.usedTemplate ? ' (تم الإرسال عبر قالب موافقة)' : ''}`);
                 } else {
-                    await ctx.reply('❌ تعذر إرسال الرسالة للواتساب. تأكد من أن الرقم مسموح له باستقبال الرسائل.');
+                    const errorNote = result.errorMessage ? `\nالسبب: ${result.errorMessage}` : '';
+                    await ctx.reply(`❌ تعذر إرسال الرسالة للواتساب.${errorNote}`);
                 }
             } else {
                 await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم الأمر /to 9665xxxxxxx للربط.');
