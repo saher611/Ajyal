@@ -91,6 +91,7 @@ async function sendWhatsAppText(phone, body, attempt = 1) {
             headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
         });
         const messageId = response.data?.messages?.[0]?.id || null;
+        console.log('WhatsApp Send Response:', response.data);
         return { ok: true, messageId };
     } catch (e) {
         const status = e.response?.status;
@@ -136,6 +137,7 @@ async function sendWhatsAppTemplateWithText(phone, bodyText) {
             headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
         });
         const messageId = response.data?.messages?.[0]?.id || null;
+        console.log('WhatsApp Template Response:', response.data);
         return { ok: true, messageId };
     } catch (e) {
         const status = e.response?.status;
@@ -410,6 +412,9 @@ app.post('/webhook', async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
     const statuses = entry?.statuses || [];
+    if (statuses.length) {
+        console.log('WhatsApp Statuses:', statuses);
+    }
     if (message) {
         const phone = normalizePhone(message.from);
         const messageId = message.id;
