@@ -377,10 +377,28 @@ bot.command('bulk', async (ctx) => {
                 failed += 1;
                 failedNumbers.push(phone);
             }
+            await sendToTelegramTopic(phone, (topicThreadId) => (
+                bot.telegram.sendMessage(
+                    TELEGRAM_CHAT_ID,
+                    `📣 رسالة جماعية:\n${message}\n\nالحالة: ${result.ok ? '✅ تم الإرسال' : '❌ فشل الإرسال'}`,
+                    { message_thread_id: topicThreadId }
+                )
+            ));
         } catch (e) {
             failed += 1;
             failedNumbers.push(phone);
             console.error('Bulk Send Error:', e.response?.data || e.message);
+            try {
+                await sendToTelegramTopic(phone, (topicThreadId) => (
+                    bot.telegram.sendMessage(
+                        TELEGRAM_CHAT_ID,
+                        `📣 رسالة جماعية:\n${message}\n\nالحالة: ❌ فشل الإرسال`,
+                        { message_thread_id: topicThreadId }
+                    )
+                ));
+            } catch (sendError) {
+                console.error('Bulk Telegram Report Error:', sendError.response?.data || sendError.message);
+            }
         }
         await sleep(200);
     }
