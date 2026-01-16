@@ -30,6 +30,7 @@ const reverseTopicCache = new Map();
 const inFlightTopics = new Map();
 const sentMessageIndex = new Map();
 const nameCache = new Map();
+const outgoingMessageStore = new Map();
 
 const normalizePhone = (phone) => {
     const raw = (phone || '').toString().trim();
@@ -164,15 +165,30 @@ async function sendWhatsAppTemplateWithText(phone, bodyText) {
     }
 }
 
-const registerSentMessage = (messageId, topicId, phone) => {
+const registerSentMessage = (messageId, topicId, phone, body, usedTemplate = false) => {
     if (!messageId || !topicId || !phone) return;
     sentMessageIndex.set(messageId, { topicId, phone, createdAt: Date.now() });
+    if (body) {
+        outgoingMessageStore.set(messageId, { phone, body, usedTemplate, createdAt: Date.now() });
+    }
     if (sentMessageIndex.size > 5000) {
         const cutoff = Date.now() - 24 * 60 * 60 * 1000;
         for (const [id, data] of sentMessageIndex.entries()) {
             if (data.createdAt < cutoff) {
                 sentMessageIndex.delete(id);
             }
+        }
+    }
+};
+
+const getOriginalOutgoing = (messageId) => outgoingMessageStore.get(messageId);
+
+const cleanupOutgoingStore = () => {
+    if (outgoingMessageStore.size < 5000) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [id, data] of outgoingMessageStore.entries()) {
+        if (data.createdAt < cutoff) {
+            outgoingMessageStore.delete(id);
         }
     }
 };
@@ -201,6 +217,12 @@ async function sendWhatsAppMessage(phone, body) {
     }
     console.error('WhatsApp Send Failed:', { phone, error: textResult.errorMessage });
     return { ...textResult, usedTemplate: false };
+}
+
+async function resendWithTemplate(phone, body) {
+    const recipientName = await getNameForPhone(phone);
+    const composedBody = recipientName ? `الأستاذ/ة ${recipientName}\n${body}` : body;
+    return sendWhatsAppTemplateWithText(phone, composedBody);
 }
 
 async function getNameForPhone(phone) {
@@ -489,6 +511,8 @@ app.post('/webhook', async (req, res) => {
                 ));
             } else if (statusValue === 'failed') {
                 const errorDetails = formatStatusErrors(status.errors);
+                const firstErrorCode = status.errors?.[0]?.code;
+                const originalMessage = getOriginalOutgoing(statusId);
                 await sendToTelegramTopic(tracked.phone, (topicThreadId) => (
                     bot.telegram.sendMessage(
                         TELEGRAM_CHAT_ID,
@@ -496,8 +520,32 @@ app.post('/webhook', async (req, res) => {
                         { message_thread_id: topicThreadId }
                     )
                 ));
+                if (firstErrorCode === 131047 && originalMessage && !originalMessage.usedTemplate) {
+                    console.warn('Retrying with template after 131047:', { phone: originalMessage.phone });
+                    const retryResult = await resendWithTemplate(originalMessage.phone, originalMessage.body);
+                    if (retryResult.ok && retryResult.messageId) {
+                        registerSentMessage(retryResult.messageId, tracked.topicId, originalMessage.phone, originalMessage.body, true);
+                        await sendToTelegramTopic(originalMessage.phone, (topicThreadId) => (
+                            bot.telegram.sendMessage(
+                                TELEGRAM_CHAT_ID,
+                                '✅ تم إعادة الإرسال بالقالب بعد انتهاء نافذة 24 ساعة.',
+                                { message_thread_id: topicThreadId }
+                            )
+                        ));
+                    } else {
+                        const retryError = retryResult.errorMessage ? `\nالسبب: ${retryResult.errorMessage}` : '';
+                        await sendToTelegramTopic(originalMessage.phone, (topicThreadId) => (
+                            bot.telegram.sendMessage(
+                                TELEGRAM_CHAT_ID,
+                                `❌ فشل إعادة الإرسال بالقالب.${retryError}`,
+                                { message_thread_id: topicThreadId }
+                            )
+                        ));
+                    }
+                }
             }
         }
+        cleanupOutgoingStore();
     }
     res.sendStatus(200);
 });
@@ -610,7 +658,7 @@ bot.command('bulk', async (ctx) => {
                 failedNumbers.push(phone);
             }
             if (result.messageId && topicId) {
-                registerSentMessage(result.messageId, topicId, phone);
+                registerSentMessage(result.messageId, topicId, phone, message, result.usedTemplate);
             }
             await sendToTelegramTopic(phone, (topicThreadId) => (
                 bot.telegram.sendMessage(
@@ -666,7 +714,7 @@ bot.on('message', async (ctx) => {
             if (phone) {
                 const result = await sendWhatsAppMessage(phone, ctx.message.text);
                 if (result.messageId) {
-                    registerSentMessage(result.messageId, topicId, phone);
+                    registerSentMessage(result.messageId, topicId, phone, ctx.message.text, result.usedTemplate);
                 }
                 if (result.ok) {
                     await ctx.reply(`✅ تم إرسال الرسالة.${result.usedTemplate ? ' (تم الإرسال عبر قالب موافقة)' : ''}`);
