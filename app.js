@@ -164,16 +164,28 @@ const registerSentMessage = (messageId, topicId, phone) => {
 };
 
 async function sendWhatsAppMessage(phone, body) {
+    console.log('WhatsApp Send Attempt:', {
+        phone,
+        bodyLength: body.length,
+        hasTemplate: Boolean(WHATSAPP_TEMPLATE_NAME)
+    });
     const textResult = await sendWhatsAppText(phone, body);
     if (textResult.ok) {
+        console.log('WhatsApp Send Success:', { phone, messageId: textResult.messageId });
         return { ...textResult, usedTemplate: false };
     }
     if (shouldUseTemplate(textResult.errorData)) {
         const recipientName = await getNameForPhone(phone);
         const composedBody = recipientName ? `الأستاذ/ة ${recipientName}\n${body}` : body;
         const templateResult = await sendWhatsAppTemplateWithText(phone, composedBody);
+        if (templateResult.ok) {
+            console.log('WhatsApp Template Success:', { phone, messageId: templateResult.messageId });
+        } else {
+            console.error('WhatsApp Template Failed:', { phone, error: templateResult.errorMessage });
+        }
         return { ...templateResult, usedTemplate: true };
     }
+    console.error('WhatsApp Send Failed:', { phone, error: textResult.errorMessage });
     return { ...textResult, usedTemplate: false };
 }
 
