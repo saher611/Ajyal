@@ -12,6 +12,8 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const TELEGRAM_WEBHOOK_DOMAIN = process.env.TELEGRAM_WEBHOOK_DOMAIN;
+const TELEGRAM_WEBHOOK_PATH = process.env.TELEGRAM_WEBHOOK_PATH || '/telegram';
 const SPREADSHEET_ID = '1coOeDXKCqgDLVrHBAwtIQ8hsDJQPED3oL1Jp-Ad7jmk';
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
@@ -428,7 +430,20 @@ app.get('/webhook', (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
+if (TELEGRAM_WEBHOOK_DOMAIN) {
+    app.use(bot.webhookCallback(TELEGRAM_WEBHOOK_PATH));
+}
+
+app.listen(PORT, async () => {
     console.log('Ajyal System Pro Online ✅');
-    bot.launch();
+    try {
+        if (TELEGRAM_WEBHOOK_DOMAIN) {
+            await bot.telegram.setWebhook(`${TELEGRAM_WEBHOOK_DOMAIN}${TELEGRAM_WEBHOOK_PATH}`);
+            console.log('Telegram webhook set ✅');
+        } else {
+            bot.launch();
+        }
+    } catch (e) {
+        console.error('Telegram Launch Error:', e.response?.data || e.message);
+    }
 });
