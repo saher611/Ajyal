@@ -82,6 +82,18 @@ const formatAxiosPayload = (configData) => {
     }
 };
 
+const formatStatusErrors = (errors = []) => {
+    if (!Array.isArray(errors) || !errors.length) return '';
+    return errors.map((err) => {
+        const code = err?.code;
+        const title = err?.title;
+        const details = err?.details;
+        return [code && `code=${code}`, title && `title=${title}`, details && `details=${details}`]
+            .filter(Boolean)
+            .join(' | ');
+    }).filter(Boolean).join(' || ');
+};
+
 async function sendWhatsAppText(phone, body, attempt = 1) {
     try {
         const response = await axios({
@@ -413,7 +425,7 @@ app.post('/webhook', async (req, res) => {
     const message = entry?.messages?.[0];
     const statuses = entry?.statuses || [];
     if (statuses.length) {
-        console.log('WhatsApp Statuses:', statuses);
+        console.log('WhatsApp Statuses:', JSON.stringify(statuses, null, 2));
     }
     if (message) {
         const phone = normalizePhone(message.from);
@@ -476,10 +488,11 @@ app.post('/webhook', async (req, res) => {
                     )
                 ));
             } else if (statusValue === 'failed') {
+                const errorDetails = formatStatusErrors(status.errors);
                 await sendToTelegramTopic(tracked.phone, (topicThreadId) => (
                     bot.telegram.sendMessage(
                         TELEGRAM_CHAT_ID,
-                        '❌ فشل تسليم الرسالة على واتساب.',
+                        `❌ فشل تسليم الرسالة على واتساب.${errorDetails ? `\nالسبب: ${errorDetails}` : ''}`,
                         { message_thread_id: topicThreadId }
                     )
                 ));
