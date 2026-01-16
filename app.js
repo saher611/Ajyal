@@ -39,6 +39,29 @@ const cacheMapping = (phone, topicId) => {
     reverseTopicCache.set(topicId, phone);
 };
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function sendWhatsAppText(phone, body, attempt = 1) {
+    try {
+        await axios({
+            method: 'POST',
+            url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+            data: { messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, type: 'text', text: { body } },
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        return { ok: true };
+    } catch (e) {
+        const status = e.response?.status;
+        const errorData = e.response?.data;
+        console.error('WhatsApp Send Error:', status, errorData || e.message);
+        if (attempt < 2) {
+            await sleep(400);
+            return sendWhatsAppText(phone, body, attempt + 1);
+        }
+        return { ok: false, status, errorData };
+    }
+}
+
 // دالة الصحين الزرقاء
 async function markAsRead(messageId) {
     try {
@@ -264,6 +287,7 @@ bot.command('bulk', async (ctx) => {
 
     let success = 0;
     let failed = 0;
+    const failedNumbers = [];
 
     for (const phone of numbers) {
         try {
@@ -271,20 +295,23 @@ bot.command('bulk', async (ctx) => {
             if (topicId) {
                 await ensureMapping(phone, topicId);
             }
-            await axios({
-                method: 'POST',
-                url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
-                data: { messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, type: 'text', text: { body: message } },
-                headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
-            });
-            success += 1;
+            const result = await sendWhatsAppText(phone, message);
+            if (result.ok) {
+                success += 1;
+            } else {
+                failed += 1;
+                failedNumbers.push(phone);
+            }
         } catch (e) {
             failed += 1;
+            failedNumbers.push(phone);
             console.error('Bulk Send Error:', e.response?.data || e.message);
         }
+        await sleep(200);
     }
 
-    await ctx.reply(`تم إرسال ${success} رسالة. فشل ${failed}.`);
+    const failureNote = failedNumbers.length ? `\nالأرقام الفاشلة: ${failedNumbers.join(', ')}` : '';
+    await ctx.reply(`تم إرسال ${success} رسالة. فشل ${failed}.${failureNote}`);
 });
 
 bot.on('message', async (ctx) => {
@@ -309,12 +336,10 @@ bot.on('message', async (ctx) => {
 
             const phone = await getPhoneByTopicId(topicId);
             if (phone) {
-                await axios({
-                    method: 'POST',
-                    url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
-                    data: { messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, type: 'text', text: { body: ctx.message.text } },
-                    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
-                });
+                const result = await sendWhatsAppText(phone, ctx.message.text);
+                if (!result.ok) {
+                    await ctx.reply('تعذر إرسال الرسالة للواتساب. تأكد من أن الرقم مسموح له باستقبال الرسائل.');
+                }
             } else {
                 await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم الأمر /to 9665xxxxxxx للربط.');
             }
