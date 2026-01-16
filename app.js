@@ -72,6 +72,16 @@ const formatWhatsAppError = (errorData, status) => {
     return parts.length ? parts.join(' | ') : `HTTP ${status || 'unknown'}`;
 };
 
+const formatAxiosPayload = (configData) => {
+    if (!configData) return '';
+    try {
+        const data = typeof configData === 'string' ? JSON.parse(configData) : configData;
+        return JSON.stringify(data);
+    } catch (e) {
+        return typeof configData === 'string' ? configData : JSON.stringify(configData);
+    }
+};
+
 async function sendWhatsAppText(phone, body, attempt = 1) {
     try {
         const response = await axios({
@@ -86,6 +96,11 @@ async function sendWhatsAppText(phone, body, attempt = 1) {
         const status = e.response?.status;
         const errorData = e.response?.data;
         console.error('WhatsApp Send Error:', status, errorData || e.message);
+        console.error('WhatsApp Send Debug:', {
+            status,
+            data: errorData,
+            request: formatAxiosPayload(e.config?.data)
+        });
         if (attempt < 2) {
             await sleep(400);
             return sendWhatsAppText(phone, body, attempt + 1);
@@ -126,6 +141,11 @@ async function sendWhatsAppTemplateWithText(phone, bodyText) {
         const status = e.response?.status;
         const errorData = e.response?.data;
         console.error('WhatsApp Template Error:', status, errorData || e.message);
+        console.error('WhatsApp Template Debug:', {
+            status,
+            data: errorData,
+            request: formatAxiosPayload(e.config?.data)
+        });
         return { ok: false, status, errorData, errorMessage: formatWhatsAppError(errorData, status) };
     }
 }
