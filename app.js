@@ -41,6 +41,11 @@ const cacheMapping = (phone, topicId) => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+const isTopicDeletedError = (error) => {
+    const description = error?.response?.description || error?.description || '';
+    return description.includes('TOPIC_DELETED');
+};
+
 async function sendWhatsAppText(phone, body, attempt = 1) {
     try {
         await axios({
@@ -59,6 +64,53 @@ async function sendWhatsAppText(phone, body, attempt = 1) {
             return sendWhatsAppText(phone, body, attempt + 1);
         }
         return { ok: false, status, errorData };
+    }
+}
+
+async function updateTopicInSheet(phone, topicId) {
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:B' });
+    const rows = res.data.values || [];
+    const rowIndex = rows.findIndex(row => normalizePhone(row[0]) === phone);
+    if (rowIndex >= 0) {
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `Sheet1!B${rowIndex + 1}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[topicId]] }
+        });
+    } else {
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Sheet1!A:B',
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[phone, topicId]] }
+        });
+    }
+}
+
+async function recreateTopicForPhone(phone) {
+    const topic = await bot.telegram.createForumTopic(TELEGRAM_CHAT_ID, `الجار: ${phone}`);
+    const topicId = topic.message_thread_id?.toString();
+    if (!topicId) return null;
+    await updateTopicInSheet(phone, topicId);
+    cacheMapping(phone, topicId);
+    return topicId;
+}
+
+async function sendToTelegramTopic(phone, sendAction) {
+    const topicId = await getOrCreateTopic(phone);
+    if (!topicId) return;
+    try {
+        await sendAction(topicId);
+    } catch (e) {
+        if (!isTopicDeletedError(e)) {
+            throw e;
+        }
+        console.warn('Topic deleted, recreating topic for phone:', phone);
+        const newTopicId = await recreateTopicForPhone(phone);
+        if (newTopicId) {
+            await sendAction(newTopicId);
+        }
     }
 }
 
@@ -200,23 +252,42 @@ app.post('/webhook', async (req, res) => {
         // تفعيل الصحين الزرقاء أولاً
         await markAsRead(messageId);
 
-        const topicId = await getOrCreateTopic(phone);
-        const options = { message_thread_id: topicId || undefined };
-
         if (message.text) {
-            await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${message.text.body}`, options);
+            await sendToTelegramTopic(phone, (topicId) => (
+                bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `📩 من ${phone}:\n${message.text.body}`, { message_thread_id: topicId })
+            ));
         } else if (message.image) {
             const buffer = await getWhatsAppMedia(message.image.id);
-            if (buffer) await bot.telegram.sendPhoto(TELEGRAM_CHAT_ID, { source: buffer }, { ...options, caption: `🖼 صورة من ${phone}` });
+            if (buffer) {
+                await sendToTelegramTopic(phone, (topicId) => (
+                    bot.telegram.sendPhoto(TELEGRAM_CHAT_ID, { source: buffer }, { message_thread_id: topicId, caption: `🖼 صورة من ${phone}` })
+                ));
+            }
         } else if (message.video) {
             const buffer = await getWhatsAppMedia(message.video.id);
-            if (buffer) await bot.telegram.sendVideo(TELEGRAM_CHAT_ID, { source: buffer }, { ...options, caption: `📹 فيديو من ${phone}` });
+            if (buffer) {
+                await sendToTelegramTopic(phone, (topicId) => (
+                    bot.telegram.sendVideo(TELEGRAM_CHAT_ID, { source: buffer }, { message_thread_id: topicId, caption: `📹 فيديو من ${phone}` })
+                ));
+            }
         } else if (message.document) {
             const buffer = await getWhatsAppMedia(message.document.id);
-            if (buffer) await bot.telegram.sendDocument(TELEGRAM_CHAT_ID, { source: buffer, filename: message.document.filename }, { ...options, caption: `📄 ملف من ${phone}` });
+            if (buffer) {
+                await sendToTelegramTopic(phone, (topicId) => (
+                    bot.telegram.sendDocument(
+                        TELEGRAM_CHAT_ID,
+                        { source: buffer, filename: message.document.filename },
+                        { message_thread_id: topicId, caption: `📄 ملف من ${phone}` }
+                    )
+                ));
+            }
         } else if (message.audio) {
             const buffer = await getWhatsAppMedia(message.audio.id);
-            if (buffer) await bot.telegram.sendVoice(TELEGRAM_CHAT_ID, { source: buffer }, options);
+            if (buffer) {
+                await sendToTelegramTopic(phone, (topicId) => (
+                    bot.telegram.sendVoice(TELEGRAM_CHAT_ID, { source: buffer }, { message_thread_id: topicId })
+                ));
+            }
         }
     }
     res.sendStatus(200);
@@ -236,11 +307,13 @@ bot.command('new', async (ctx) => {
             return;
         }
         await ensureMapping(phone, topicId);
-        await bot.telegram.sendMessage(
-            TELEGRAM_CHAT_ID,
-            `✅ تم إنشاء غرفة وربط الرقم ${phone}. اكتب رسالتك هنا لإرسالها للواتساب.`,
-            { message_thread_id: topicId }
-        );
+        await sendToTelegramTopic(phone, (threadId) => (
+            bot.telegram.sendMessage(
+                TELEGRAM_CHAT_ID,
+                `✅ تم إنشاء غرفة وربط الرقم ${phone}. اكتب رسالتك هنا لإرسالها للواتساب.`,
+                { message_thread_id: threadId }
+            )
+        ));
         await ctx.reply(`تم إنشاء غرفة للرقم ${phone}.`);
     } catch (e) {
         console.error('New Topic Error:', e.response?.data || e.message);
