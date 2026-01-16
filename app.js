@@ -12,6 +12,8 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATSAPP_TEMPLATE_NAME = process.env.WHATSAPP_TEMPLATE_NAME;
+const WHATSAPP_TEMPLATE_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'ar';
 const TELEGRAM_WEBHOOK_DOMAIN = process.env.TELEGRAM_WEBHOOK_DOMAIN;
 const TELEGRAM_WEBHOOK_PATH = process.env.TELEGRAM_WEBHOOK_PATH || '/telegram';
 const SPREADSHEET_ID = '1coOeDXKCqgDLVrHBAwtIQ8hsDJQPED3oL1Jp-Ad7jmk';
@@ -26,6 +28,8 @@ const sheets = google.sheets({ version: 'v4', auth });
 const topicCache = new Map();
 const reverseTopicCache = new Map();
 const inFlightTopics = new Map();
+const sentMessageIndex = new Map();
+const nameCache = new Map();
 
 const normalizePhone = (phone) => {
     const raw = (phone || '').toString().trim();
@@ -48,15 +52,22 @@ const isTopicDeletedError = (error) => {
     return description.includes('TOPIC_DELETED');
 };
 
+const shouldUseTemplate = (errorData) => {
+    const code = errorData?.error?.code;
+    const message = (errorData?.error?.message || '').toLowerCase();
+    return code === 131047 || message.includes('template') || message.includes('outside the allowed window');
+};
+
 async function sendWhatsAppText(phone, body, attempt = 1) {
     try {
-        await axios({
+        const response = await axios({
             method: 'POST',
             url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
             data: { messaging_product: 'whatsapp', recipient_type: 'individual', to: phone, type: 'text', text: { body } },
             headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
         });
-        return { ok: true };
+        const messageId = response.data?.messages?.[0]?.id || null;
+        return { ok: true, messageId };
     } catch (e) {
         const status = e.response?.status;
         const errorData = e.response?.data;
@@ -67,6 +78,111 @@ async function sendWhatsAppText(phone, body, attempt = 1) {
         }
         return { ok: false, status, errorData };
     }
+}
+
+async function sendWhatsAppTemplateWithText(phone, bodyText) {
+    if (!WHATSAPP_TEMPLATE_NAME) {
+        return { ok: false, message: 'Template name not configured' };
+    }
+    try {
+        const response = await axios({
+            method: 'POST',
+            url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+            data: {
+                messaging_product: 'whatsapp',
+                recipient_type: 'individual',
+                to: phone,
+                type: 'template',
+                template: {
+                    name: WHATSAPP_TEMPLATE_NAME,
+                    language: { code: WHATSAPP_TEMPLATE_LANG },
+                    components: [
+                        {
+                            type: 'body',
+                            parameters: [{ type: 'text', text: bodyText }]
+                        }
+                    ]
+                }
+            },
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        const messageId = response.data?.messages?.[0]?.id || null;
+        return { ok: true, messageId };
+    } catch (e) {
+        const status = e.response?.status;
+        const errorData = e.response?.data;
+        console.error('WhatsApp Template Error:', status, errorData || e.message);
+        return { ok: false, status, errorData };
+    }
+}
+
+const registerSentMessage = (messageId, topicId, phone) => {
+    if (!messageId || !topicId || !phone) return;
+    sentMessageIndex.set(messageId, { topicId, phone, createdAt: Date.now() });
+    if (sentMessageIndex.size > 5000) {
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        for (const [id, data] of sentMessageIndex.entries()) {
+            if (data.createdAt < cutoff) {
+                sentMessageIndex.delete(id);
+            }
+        }
+    }
+};
+
+async function sendWhatsAppMessage(phone, body) {
+    const textResult = await sendWhatsAppText(phone, body);
+    if (textResult.ok) {
+        return { ...textResult, usedTemplate: false };
+    }
+    if (shouldUseTemplate(textResult.errorData)) {
+        const recipientName = await getNameForPhone(phone);
+        const composedBody = recipientName ? `الأستاذ/ة ${recipientName}\n${body}` : body;
+        const templateResult = await sendWhatsAppTemplateWithText(phone, composedBody);
+        return { ...templateResult, usedTemplate: true };
+    }
+    return { ...textResult, usedTemplate: false };
+}
+
+async function getNameForPhone(phone) {
+    const normalizedPhone = normalizePhone(phone);
+    if (!normalizedPhone) return '';
+    if (nameCache.has(normalizedPhone)) {
+        return nameCache.get(normalizedPhone);
+    }
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:C' });
+    const rows = res.data.values || [];
+    const match = rows.find(row => normalizePhone(row[0]) === normalizedPhone);
+    const name = match?.[2]?.toString().trim() || '';
+    if (name) {
+        nameCache.set(normalizedPhone, name);
+    }
+    return name;
+}
+
+async function setNameForPhone(phone, name) {
+    const normalizedPhone = normalizePhone(phone);
+    if (!normalizedPhone) return false;
+    const trimmedName = name.trim();
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Sheet1!A:C' });
+    const rows = res.data.values || [];
+    const rowIndex = rows.findIndex(row => normalizePhone(row[0]) === normalizedPhone);
+    if (rowIndex >= 0) {
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `Sheet1!C${rowIndex + 1}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[trimmedName]] }
+        });
+    } else {
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Sheet1!A:C',
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[normalizedPhone, '', trimmedName]] }
+        });
+    }
+    nameCache.set(normalizedPhone, trimmedName);
+    return true;
 }
 
 async function updateTopicInSheet(phone, topicId) {
@@ -247,6 +363,7 @@ async function getOrCreateTopic(phone) {
 app.post('/webhook', async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = entry?.messages?.[0];
+    const statuses = entry?.statuses || [];
     if (message) {
         const phone = normalizePhone(message.from);
         const messageId = message.id;
@@ -292,6 +409,32 @@ app.post('/webhook', async (req, res) => {
             }
         }
     }
+
+    if (statuses.length) {
+        for (const status of statuses) {
+            const statusId = status.id;
+            const statusValue = status.status;
+            const tracked = sentMessageIndex.get(statusId);
+            if (!tracked) continue;
+            if (statusValue === 'read') {
+                await sendToTelegramTopic(tracked.phone, (topicThreadId) => (
+                    bot.telegram.sendMessage(
+                        TELEGRAM_CHAT_ID,
+                        '✅ تم قراءة الرسالة على واتساب.',
+                        { message_thread_id: topicThreadId }
+                    )
+                ));
+            } else if (statusValue === 'failed') {
+                await sendToTelegramTopic(tracked.phone, (topicThreadId) => (
+                    bot.telegram.sendMessage(
+                        TELEGRAM_CHAT_ID,
+                        '❌ فشل تسليم الرسالة على واتساب.',
+                        { message_thread_id: topicThreadId }
+                    )
+                ));
+            }
+        }
+    }
     res.sendStatus(200);
 });
 
@@ -320,6 +463,31 @@ bot.command('new', async (ctx) => {
     } catch (e) {
         console.error('New Topic Error:', e.response?.data || e.message);
         await ctx.reply('تعذر إنشاء غرفة للرقم.');
+    }
+});
+
+bot.command('name', async (ctx) => {
+    const topicId = ctx.message.message_thread_id?.toString();
+    const rawName = ctx.message.text.replace('/name', '').trim();
+    if (!topicId) {
+        await ctx.reply('استخدم الأمر داخل الغرفة.');
+        return;
+    }
+    if (!rawName) {
+        await ctx.reply('اكتب الاسم بعد الأمر مثل: /name محمد');
+        return;
+    }
+    try {
+        const phone = await getPhoneByTopicId(topicId);
+        if (!phone) {
+            await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم /to أولاً.');
+            return;
+        }
+        await setNameForPhone(phone, rawName);
+        await ctx.reply(`تم حفظ الاسم للرقم ${phone}.`);
+    } catch (e) {
+        console.error('Name Update Error:', e.response?.data || e.message);
+        await ctx.reply('تعذر حفظ الاسم.');
     }
 });
 
@@ -370,17 +538,20 @@ bot.command('bulk', async (ctx) => {
             if (topicId) {
                 await ensureMapping(phone, topicId);
             }
-            const result = await sendWhatsAppText(phone, message);
+            const result = await sendWhatsAppMessage(phone, message);
             if (result.ok) {
                 success += 1;
             } else {
                 failed += 1;
                 failedNumbers.push(phone);
             }
+            if (result.messageId && topicId) {
+                registerSentMessage(result.messageId, topicId, phone);
+            }
             await sendToTelegramTopic(phone, (topicThreadId) => (
                 bot.telegram.sendMessage(
                     TELEGRAM_CHAT_ID,
-                    `📣 رسالة جماعية:\n${message}\n\nالحالة: ${result.ok ? '✅ تم الإرسال' : '❌ فشل الإرسال'}`,
+                    `📣 رسالة جماعية:\n${message}\n\nالحالة: ${result.ok ? '✅ تم الإرسال' : '❌ فشل الإرسال'}${result.usedTemplate ? '\nتم الإرسال عبر قالب موافقة.' : ''}`,
                     { message_thread_id: topicThreadId }
                 )
             ));
@@ -429,9 +600,14 @@ bot.on('message', async (ctx) => {
 
             const phone = await getPhoneByTopicId(topicId);
             if (phone) {
-                const result = await sendWhatsAppText(phone, ctx.message.text);
-                if (!result.ok) {
-                    await ctx.reply('تعذر إرسال الرسالة للواتساب. تأكد من أن الرقم مسموح له باستقبال الرسائل.');
+                const result = await sendWhatsAppMessage(phone, ctx.message.text);
+                if (result.messageId) {
+                    registerSentMessage(result.messageId, topicId, phone);
+                }
+                if (result.ok) {
+                    await ctx.reply(`✅ تم إرسال الرسالة.${result.usedTemplate ? ' (تم الإرسال عبر قالب موافقة)' : ''}`);
+                } else {
+                    await ctx.reply('❌ تعذر إرسال الرسالة للواتساب. تأكد من أن الرقم مسموح له باستقبال الرسائل.');
                 }
             } else {
                 await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم الأمر /to 9665xxxxxxx للربط.');
