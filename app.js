@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const { Telegraf } = require('telegraf');
+const FormData = require('form-data');
 const { google } = require('googleapis');
 
 const app = express();
@@ -161,6 +162,72 @@ async function sendWhatsAppTemplateWithText(phone, bodyText) {
             data: errorData,
             request: formatAxiosPayload(e.config?.data)
         });
+        return { ok: false, status, errorData, errorMessage: formatWhatsAppError(errorData, status) };
+    }
+}
+
+async function getTelegramFileBuffer(fileId) {
+    try {
+        const link = await bot.telegram.getFileLink(fileId);
+        const response = await axios.get(link.href, { responseType: 'arraybuffer' });
+        return Buffer.from(response.data);
+    } catch (e) {
+        console.error('Telegram File Error:', e.response?.data || e.message);
+        return null;
+    }
+}
+
+async function uploadWhatsAppMedia(buffer, mimeType, filename) {
+    try {
+        const form = new FormData();
+        form.append('messaging_product', 'whatsapp');
+        if (mimeType) {
+            form.append('type', mimeType);
+        }
+        form.append('file', buffer, { filename: filename || 'file', contentType: mimeType || 'application/octet-stream' });
+        const response = await axios.post(
+            `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/media`,
+            form,
+            { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, ...form.getHeaders() } }
+        );
+        return response.data?.id || null;
+    } catch (e) {
+        const status = e.response?.status;
+        const errorData = e.response?.data;
+        console.error('WhatsApp Media Upload Error:', status, errorData || e.message);
+        return null;
+    }
+}
+
+async function sendWhatsAppMediaMessage(phone, mediaType, buffer, mimeType, filename) {
+    const mediaId = await uploadWhatsAppMedia(buffer, mimeType, filename);
+    if (!mediaId) {
+        return { ok: false, errorMessage: 'media_upload_failed' };
+    }
+    try {
+        const payload = {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: phone,
+            type: mediaType,
+            [mediaType]: { id: mediaId }
+        };
+        if (mediaType === 'document' && filename) {
+            payload.document.filename = filename;
+        }
+        const response = await axios({
+            method: 'POST',
+            url: `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`,
+            data: payload,
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        const messageId = response.data?.messages?.[0]?.id || null;
+        console.log('WhatsApp Media Send Response:', response.data);
+        return { ok: true, messageId };
+    } catch (e) {
+        const status = e.response?.status;
+        const errorData = e.response?.data;
+        console.error('WhatsApp Media Send Error:', status, errorData || e.message);
         return { ok: false, status, errorData, errorMessage: formatWhatsAppError(errorData, status) };
     }
 }
@@ -692,8 +759,9 @@ bot.command('bulk', async (ctx) => {
 
 bot.on('message', async (ctx) => {
     const topicId = ctx.message.message_thread_id?.toString();
-    if (topicId && ctx.message.text) {
-        try {
+    if (!topicId) return;
+    try {
+        if (ctx.message.text) {
             const text = ctx.message.text.trim();
             if (text.startsWith('/to ')) {
                 const phone = normalizePhone(text.replace('/to', '').trim());
@@ -709,25 +777,87 @@ bot.on('message', async (ctx) => {
                 }
                 return;
             }
-
-            const phone = await getPhoneByTopicId(topicId);
-            if (phone) {
-                const result = await sendWhatsAppMessage(phone, ctx.message.text);
-                if (result.messageId) {
-                    registerSentMessage(result.messageId, topicId, phone, ctx.message.text, result.usedTemplate);
-                }
-                if (result.ok) {
-                    await ctx.reply(`✅ تم إرسال الرسالة.${result.usedTemplate ? ' (تم الإرسال عبر قالب موافقة)' : ''}`);
-                } else {
-                    const errorNote = result.errorMessage ? `\nالسبب: ${result.errorMessage}` : '';
-                    await ctx.reply(`❌ تعذر إرسال الرسالة للواتساب.${errorNote}`);
-                }
-            } else {
-                await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم الأمر /to 9665xxxxxxx للربط.');
-            }
-        } catch (e) {
-            console.error('Send Error:', e.response?.data || e.message);
         }
+
+        const phone = await getPhoneByTopicId(topicId);
+        if (!phone) {
+            await ctx.reply('لا يوجد رقم مربوط لهذه الغرفة. استخدم الأمر /to 9665xxxxxxx للربط.');
+            return;
+        }
+
+        if (ctx.message.text) {
+            const result = await sendWhatsAppMessage(phone, ctx.message.text);
+            if (result.messageId) {
+                registerSentMessage(result.messageId, topicId, phone, ctx.message.text, result.usedTemplate);
+            }
+            if (result.ok) {
+                await ctx.reply(`✅ تم إرسال الرسالة.${result.usedTemplate ? ' (تم الإرسال عبر قالب موافقة)' : ''}`);
+            } else {
+                const errorNote = result.errorMessage ? `\nالسبب: ${result.errorMessage}` : '';
+                await ctx.reply(`❌ تعذر إرسال الرسالة للواتساب.${errorNote}`);
+            }
+            return;
+        }
+
+        if (ctx.message.photo) {
+            const photo = ctx.message.photo[ctx.message.photo.length - 1];
+            const buffer = await getTelegramFileBuffer(photo.file_id);
+            if (!buffer) {
+                await ctx.reply('تعذر تحميل الصورة من تيليجرام.');
+                return;
+            }
+            const result = await sendWhatsAppMediaMessage(phone, 'image', buffer, 'image/jpeg', 'photo.jpg');
+            if (result.messageId) {
+                registerSentMessage(result.messageId, topicId, phone, '[photo]', false);
+            }
+            await ctx.reply(result.ok ? '✅ تم إرسال الصورة.' : `❌ فشل إرسال الصورة.${result.errorMessage ? `\nالسبب: ${result.errorMessage}` : ''}`);
+            return;
+        }
+
+        if (ctx.message.video) {
+            const buffer = await getTelegramFileBuffer(ctx.message.video.file_id);
+            if (!buffer) {
+                await ctx.reply('تعذر تحميل الفيديو من تيليجرام.');
+                return;
+            }
+            const result = await sendWhatsAppMediaMessage(phone, 'video', buffer, ctx.message.video.mime_type || 'video/mp4', 'video.mp4');
+            if (result.messageId) {
+                registerSentMessage(result.messageId, topicId, phone, '[video]', false);
+            }
+            await ctx.reply(result.ok ? '✅ تم إرسال الفيديو.' : `❌ فشل إرسال الفيديو.${result.errorMessage ? `\nالسبب: ${result.errorMessage}` : ''}`);
+            return;
+        }
+
+        if (ctx.message.document) {
+            const buffer = await getTelegramFileBuffer(ctx.message.document.file_id);
+            if (!buffer) {
+                await ctx.reply('تعذر تحميل الملف من تيليجرام.');
+                return;
+            }
+            const filename = ctx.message.document.file_name || 'document';
+            const result = await sendWhatsAppMediaMessage(phone, 'document', buffer, ctx.message.document.mime_type || 'application/octet-stream', filename);
+            if (result.messageId) {
+                registerSentMessage(result.messageId, topicId, phone, `[document] ${filename}`, false);
+            }
+            await ctx.reply(result.ok ? '✅ تم إرسال الملف.' : `❌ فشل إرسال الملف.${result.errorMessage ? `\nالسبب: ${result.errorMessage}` : ''}`);
+            return;
+        }
+
+        if (ctx.message.voice || ctx.message.audio) {
+            const audio = ctx.message.voice || ctx.message.audio;
+            const buffer = await getTelegramFileBuffer(audio.file_id);
+            if (!buffer) {
+                await ctx.reply('تعذر تحميل الصوت من تيليجرام.');
+                return;
+            }
+            const result = await sendWhatsAppMediaMessage(phone, 'audio', buffer, audio.mime_type || 'audio/ogg', 'audio.ogg');
+            if (result.messageId) {
+                registerSentMessage(result.messageId, topicId, phone, '[audio]', false);
+            }
+            await ctx.reply(result.ok ? '✅ تم إرسال الصوت.' : `❌ فشل إرسال الصوت.${result.errorMessage ? `\nالسبب: ${result.errorMessage}` : ''}`);
+        }
+    } catch (e) {
+        console.error('Send Error:', e.response?.data || e.message);
     }
 });
 
