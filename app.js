@@ -248,6 +248,7 @@ async function smartSendWhatsApp(phone, body) {
     return attempt1;
 }
 
+// تحميل و إرسال ميديا من تيليجرام إلى واتساب
 async function uploadAndSendMedia(phone, buffer, mimeType, filename, mediaType) {
     try {
         // 1. Upload
@@ -281,6 +282,90 @@ async function uploadAndSendMedia(phone, buffer, mimeType, filename, mediaType) 
         return { ok: false, errorMessage: e.message };
     }
 }
+
+// دالة مساعدة لتحميل ميديا من واتساب وإرسالها لتيليجرام
+async function relayMediaToTelegram(message, topicId, phone) {
+    try {
+        const supportedTypes = ['image', 'video', 'audio', 'document', 'voice', 'sticker'];
+        const mediaType = supportedTypes.find(t => message[t]);
+
+        if (!mediaType) {
+            console.log(`⚠️ Unsupported media type from ${phone}`);
+            await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: [مرفق غير مدعوم]`, { message_thread_id: topicId });
+            return;
+        }
+
+        const mediaItem = message[mediaType];
+        const mediaId = mediaItem.id;
+
+        console.log(`📥 Downloading ${mediaType} from ${phone}...`);
+
+        // 1. Get Media URL
+        const mediaUrlRes = await axios.get(
+            `https://graph.facebook.com/v20.0/${mediaId}`,
+            { headers: { Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}` } }
+        );
+        const mediaUrl = mediaUrlRes.data?.url;
+
+        if (!mediaUrl) throw new Error('Failed to get media URL');
+
+        // 2. Download Media Blob
+        const fileRes = await axios.get(mediaUrl, {
+            responseType: 'arraybuffer',
+            headers: {
+                Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}`,
+                'User-Agent': 'WhatsApp-Telegram-Bridge/1.0'
+            }
+        });
+
+        const fileBuffer = Buffer.from(fileRes.data);
+        const caption = message.caption || `وصل ملف (${mediaType}) من ${phone}`;
+
+        // 3. Send to Telegram
+        const telegramMethods = {
+            image: 'sendPhoto',
+            video: 'sendVideo',
+            audio: 'sendAudio',
+            voice: 'sendVoice',
+            document: 'sendDocument',
+            sticker: 'sendSticker'
+        };
+
+        const method = telegramMethods[mediaType];
+
+        const filePayload = { source: fileBuffer };
+        if (mediaType === 'document' && mediaItem.filename) {
+            filePayload.filename = mediaItem.filename;
+        } else if (mediaType === 'document') {
+            // Try to guess extension or default
+            const mime = mediaItem.mime_type || 'application/octet-stream';
+            const ext = mime.split('/')[1] || 'bin';
+            filePayload.filename = `file_${Date.now()}.${ext}`;
+        }
+
+        const options = { message_thread_id: topicId };
+        // Stickers cannot have captions in some contexts, but sendSticker doesn't support caption usually? 
+        // Actually Telegram sendSticker does NOT support caption.
+        // Others do.
+        if (mediaType !== 'sticker' && mediaType !== 'voice') {
+            options.caption = caption;
+        }
+
+        try {
+            await bot.telegram[method](CONFIG.TELEGRAM.CHAT_ID, filePayload, options);
+            console.log(`✅ Relayed ${mediaType} to Telegram topic ${topicId}`);
+        } catch (sendErr) {
+            // Fallback for document if photo/video fails (sometimes compression issues)
+            console.warn(`⚠️ Failed to send as ${mediaType}, trying as document...`, sendErr.message);
+            await bot.telegram.sendDocument(CONFIG.TELEGRAM.CHAT_ID, filePayload, { message_thread_id: topicId, caption: caption });
+        }
+
+    } catch (e) {
+        console.error('❌ Failed to relay media to Telegram:', e.message);
+        await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `⚠️ فشل استلام ملف من ${phone}: ${e.message}`, { message_thread_id: topicId });
+    }
+}
+
 
 // ==========================================
 // منطق الغرف والربط (Topic & Linking Logic)
@@ -388,23 +473,8 @@ app.post('/webhook', async (req, res) => {
             if (message.text) {
                 await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}:\n${message.text.body}`, { message_thread_id: topicId });
             } else {
-                // التعامل مع الميديا
-                const mediaType = ['image', 'video', 'audio', 'document', 'voice'].find(t => message[t]);
-                if (mediaType) {
-                    const mediaId = message[mediaType].id;
-                    const mediaUrlRes = await waAxios.get(`/${mediaId}`);
-                    const fileBuf = await axios.get(mediaUrlRes.data.url, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}` } });
-
-                    const caption = `وصل ملف (${mediaType}) من ${phone}`;
-                    const sendMethod = mediaType === 'image' ? 'sendPhoto' :
-                        mediaType === 'video' ? 'sendVideo' :
-                            mediaType === 'voice' ? 'sendVoice' : 'sendDocument';
-
-                    const filePayload = { source: Buffer.from(fileBuf.data) };
-                    if (mediaType === 'document') filePayload.filename = message.document.filename;
-
-                    await bot.telegram[sendMethod](CONFIG.TELEGRAM.CHAT_ID, filePayload, { message_thread_id: topicId, caption });
-                }
+                // التعامل مع الميديا المطور واستدعاء الدالة الجديدة
+                await relayMediaToTelegram(message, topicId, phone);
             }
         } catch (e) {
             console.error('❌ Failed to relay to Telegram:', e.message);
@@ -450,11 +520,7 @@ bot.command('bulk', async (ctx) => {
         // Strict pipe mode
         message = msgPart.trim();
     } else {
-        // Newline mode: first line message? No, user logic was complex. Let's simplify:
-        // If no pipe, assume bulk requires pipe or just fail to encourage strictness.
-        // Or keep user's logic:
         const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
-        // If logic is ambiguous, assume pipe is safer. But let's support "Lines of numbers, first line is message" if NO pipe.
         if (lines.length > 1) {
             message = lines[0]; // First line is MSG
             numbersPart = lines.slice(1).join(','); // Rest are numbers
