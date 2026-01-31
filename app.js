@@ -331,6 +331,16 @@ async function relayMediaToTelegram(message, topicId, phone) {
         }
 
         // ============================
+        // Handle Button
+        // ============================
+        if (message.type === 'button' || message.button) {
+            const btnText = message.button?.text || message.button?.payload || 'زر غير معروف';
+            console.log(`🔘 Button response from ${phone}: ${btnText}`);
+            await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: [زر] ${btnText}`, { message_thread_id: topicId });
+            return;
+        }
+
+        // ============================
         // Handle Unknown/Unsupported
         // ============================
         if (!mediaType) {
