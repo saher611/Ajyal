@@ -168,8 +168,10 @@ async function syncSheetsToMemory() {
             }
         });
         console.log(`✅ Synced ${count} records from Sheets.`);
+        return true;
     } catch (e) {
         console.error('❌ Sheet Sync Error:', e.message);
+        return false;
     }
 }
 
@@ -289,12 +291,68 @@ async function relayMediaToTelegram(message, topicId, phone) {
         const supportedTypes = ['image', 'video', 'audio', 'document', 'voice', 'sticker'];
         const mediaType = supportedTypes.find(t => message[t]);
 
-        if (!mediaType) {
-            console.log(`⚠️ Unsupported media type from ${phone}`);
-            await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: [مرفق غير مدعوم]`, { message_thread_id: topicId });
+        // ============================
+        // Handle Location
+        // ============================
+        if (message.location) {
+            const { latitude, longitude, name, address } = message.location;
+            console.log(`📍 Location from ${phone}`);
+
+            // Telegram 'sendLocation' doesn't easily support captions or inside topics perfectly with simple interface sometimes, but let's try.
+            try {
+                // Send specific location
+                await bot.telegram.sendLocation(CONFIG.TELEGRAM.CHAT_ID, latitude, longitude, {
+                    message_thread_id: topicId,
+                    horizontal_accuracy: message.location.accuracy
+                });
+                // If there is name/address, send as text context
+                if (name || address) {
+                    await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📍 ${name || ''}\n${address || ''}`, { message_thread_id: topicId });
+                }
+            } catch (locErr) {
+                // Fallback to text link
+                const mapLink = `https://maps.google.com/?q=${latitude},${longitude}`;
+                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📍 موقع من ${phone}:\n${mapLink}`, { message_thread_id: topicId });
+            }
             return;
         }
 
+        // ============================
+        // Handle Contacts
+        // ============================
+        if (message.contacts) {
+            console.log(`👤 Contacts from ${phone}`);
+            for (const contact of message.contacts) {
+                const name = contact.name?.formatted_name || 'Unknown';
+                const phones = contact.phones?.map(p => p.phone).join(', ') || 'No number';
+                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `👤 جهة اتصال من ${phone}:\nالاسم: ${name}\nالرقم: ${phones}`, { message_thread_id: topicId });
+            }
+            return;
+        }
+
+        // ============================
+        // Handle Unknown/Unsupported
+        // ============================
+        if (!mediaType) {
+            console.log(`⚠️ Unsupported media type from ${phone}:`, JSON.stringify(message, null, 2));
+            // Don't just say "Unsupported", try to give raw info if possible or specific error.
+            if (message.interactive) {
+                const type = message.interactive.type; // button_reply, list_reply
+                let text = '[تفاعل]';
+                if (type === 'button_reply') text = `[زر] ${message.interactive.button_reply.title}`;
+                if (type === 'list_reply') text = `[قائمة] ${message.interactive.list_reply.title}`;
+
+                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: ${text}`, { message_thread_id: topicId });
+                return;
+            }
+
+            await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: [مرفق غير مدعوم - راجع السجل]`, { message_thread_id: topicId });
+            return;
+        }
+
+        // ============================
+        // Handle Supported Media
+        // ============================
         const mediaItem = message[mediaType];
         const mediaId = mediaItem.id;
 
@@ -344,9 +402,7 @@ async function relayMediaToTelegram(message, topicId, phone) {
         }
 
         const options = { message_thread_id: topicId };
-        // Stickers cannot have captions in some contexts, but sendSticker doesn't support caption usually? 
-        // Actually Telegram sendSticker does NOT support caption.
-        // Others do.
+
         if (mediaType !== 'sticker' && mediaType !== 'voice') {
             options.caption = caption;
         }
@@ -382,9 +438,9 @@ async function getOrCreateTopic(phone) {
 
     const task = (async () => {
         try {
-            // double check after async wait
-            // Note: We already synced Sheets at startup, so memory should be fresh.
-            // But let's check creating new if minimal
+            // 3. Optional: Double check sheet before creating (redundant if sync works but safe)
+            // Not modifying here to keep it fast, relying on bot.on message sync fallback.
+
             const topic = await bot.telegram.createForumTopic(CONFIG.TELEGRAM.CHAT_ID, `الجار: ${normalized}`);
             const topicId = topic.message_thread_id.toString();
 
@@ -449,6 +505,7 @@ app.post('/webhook', async (req, res) => {
 
             if (logMsg && topicId) {
                 try {
+                    // Check if topic exists before sending status, but usually fire and forget is fine here.
                     await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, logMsg, { message_thread_id: topicId });
                 } catch (e) { /* ignore topic deleted errors here mostly */ }
             }
@@ -473,7 +530,7 @@ app.post('/webhook', async (req, res) => {
             if (message.text) {
                 await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}:\n${message.text.body}`, { message_thread_id: topicId });
             } else {
-                // التعامل مع الميديا المطور واستدعاء الدالة الجديدة
+                // التعامل مع الميديا المطور/الموقع/جهات الاتصال واستدعاء الدالة الجديدة
                 await relayMediaToTelegram(message, topicId, phone);
             }
         } catch (e) {
@@ -567,9 +624,19 @@ bot.on('message', async (ctx) => {
     if (!topicId) return;
 
     // البحث عن الرقم المرتبط بهذه الغرفة
-    const phone = state.reverseTopicCache.get(topicId);
+    let phone = state.reverseTopicCache.get(topicId);
+
+    // If phone not found in cache, try to resync and check again (Fix for "Room not linked")
     if (!phone) {
-        // Try to sync just in case
+        console.log(`⚠️ Topic ${topicId} not in cache, attempting sync...`);
+        const synced = await syncSheetsToMemory();
+        if (synced) {
+            phone = state.reverseTopicCache.get(topicId);
+        }
+    }
+
+    if (!phone) {
+        // Maybe the user deleted the row from the sheet or something?
         return ctx.reply('هذه الغرفة غير مرتبطة برقم واتساب (أو لم تتم المزامنة بعد). استخدم /new للإنشاء الصحيح.');
     }
 
