@@ -212,8 +212,27 @@ async function sendWhatsAppText(phone, body) {
     });
 }
 
-async function sendWhatsAppTemplate(phone, bodyText) {
+async function sendWhatsAppTemplate(phone, nameParam, bodyParam) {
     if (!CONFIG.WHATSAPP.TEMPLATE_NAME) return { ok: false, errorMessage: 'No Template Configured' };
+
+    // Ensure we have a value for the header variable {{1}} even if name is missing
+    const headerText = nameParam || 'مشترك';
+    const bodyText = bodyParam || '...';
+
+    const components = [
+        {
+            type: 'header',
+            parameters: [{ type: 'text', text: headerText }]
+        },
+        {
+            type: 'body',
+            parameters: [{ type: 'text', text: bodyText }]
+        }
+    ];
+
+    console.log(`📝 Sending Template [${CONFIG.WHATSAPP.TEMPLATE_NAME}] to ${phone}`);
+    console.log('Variables:', { header: headerText, body: bodyText });
+
     return safeWaRequest('POST', '/messages', {
         messaging_product: 'whatsapp',
         recipient_type: 'individual',
@@ -222,10 +241,7 @@ async function sendWhatsAppTemplate(phone, bodyText) {
         template: {
             name: CONFIG.WHATSAPP.TEMPLATE_NAME,
             language: { code: CONFIG.WHATSAPP.TEMPLATE_LANG },
-            components: [{
-                type: 'body',
-                parameters: [{ type: 'text', text: bodyText }]
-            }]
+            components: components
         }
     });
 }
@@ -242,8 +258,12 @@ async function smartSendWhatsApp(phone, body) {
     if (isSessionExpired) {
         console.log(`⚠️ Session expired for ${phone}, trying template...`);
         const name = state.names.get(phone) || '';
-        const templateBody = name ? `الأستاذ/ة ${name}\n${body}` : body;
-        const attempt2 = await sendWhatsAppTemplate(phone, templateBody);
+
+        // Remove excessive newlines just to be safe, but keep basic structure
+        // Meta sometimes rejects body parameters with too many newlines or complex logic
+        let cleanBody = body.replace(/\n\s*\n/g, '\n').trim();
+
+        const attempt2 = await sendWhatsAppTemplate(phone, name, cleanBody);
         return { ...attempt2, usedTemplate: true };
     }
 
@@ -627,6 +647,30 @@ bot.command('bulk', async (ctx) => {
 
     ctx.reply(`انتهى الإرسال.\n✅ نجاح: ${stats.success}\n❌ فشل: ${stats.failed}`);
     saveStateToDisk(); // Save state after bulk
+});
+
+// أمر فحص القالب
+bot.command('test_template', async (ctx) => {
+    // Usage: /test_template 966xxxxxx
+    const raw = ctx.message.text.replace('/test_template', '').trim();
+    const phone = normalizePhone(raw);
+
+    if (!phone) return ctx.reply('الاستخدام: /test_template 966xxxxxxxxx');
+
+    ctx.reply(`⏳ جاري تجربة إرسال القالب إلى ${phone}...\nاسم القالب: ${CONFIG.WHATSAPP.TEMPLATE_NAME || 'غير محدد'}\nاللغة: ${CONFIG.WHATSAPP.TEMPLATE_LANG}`);
+
+    // تجربة نص ومتغير رأس
+    const testName = 'تجربة';
+    const testBody = 'هذه رسالة تجريبية للتأكد من عمل القالب بشكل صحيح.';
+
+    const res = await sendWhatsAppTemplate(phone, testName, testBody);
+
+    if (res.ok) {
+        ctx.reply('✅ تم إرسال طلب القالب بنجاح! (Name + Body). تحقق من وصول الرسالة.');
+    } else {
+        ctx.reply(`❌ فشل الإرسال:\n${res.errorMessage}\nCode: ${res.errorData?.error?.code}`);
+        console.error('Test Template Error:', JSON.stringify(res.errorData, null, 2));
+    }
 });
 
 bot.on('message', async (ctx) => {
