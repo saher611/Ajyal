@@ -3,744 +3,575 @@ const axios = require('axios');
 const { Telegraf } = require('telegraf');
 const FormData = require('form-data');
 const { google } = require('googleapis');
-const fs = require('fs');
+const fs = require('fs/promises');
 const path = require('path');
 
-// ==========================================
-// التكوين والإعدادات (Configuration)
-// ==========================================
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
-const requiredEnv = [
-    'TELEGRAM_TOKEN', 'TELEGRAM_CHAT_ID', 'WHATSAPP_TOKEN',
-    'PHONE_NUMBER_ID', 'VERIFY_TOKEN', 'GOOGLE_EMAIL', 'GOOGLE_KEY'
-];
-const missingEnv = requiredEnv.filter(key => !process.env[key]);
-if (missingEnv.length > 0) {
-    console.error('❌ Missing Environment Variables:', missingEnv.join(', '));
-    process.exit(1);
-}
+const env = (key, fallback = undefined) => {
+  const value = process.env[key] ?? fallback;
+  if (value === undefined || value === '') throw new Error(`Missing env: ${key}`);
+  return value;
+};
+
+const optionalEnv = (key, fallback = undefined) => process.env[key] || fallback;
 
 const CONFIG = {
-    TELEGRAM: {
-        TOKEN: process.env.TELEGRAM_TOKEN,
-        CHAT_ID: process.env.TELEGRAM_CHAT_ID,
-        WEBHOOK_DOMAIN: process.env.TELEGRAM_WEBHOOK_DOMAIN,
-        WEBHOOK_PATH: process.env.TELEGRAM_WEBHOOK_PATH || '/telegram'
-    },
-    WHATSAPP: {
-        TOKEN: process.env.WHATSAPP_TOKEN,
-        PHONE_ID: process.env.PHONE_NUMBER_ID,
-        TEMPLATE_NAME: process.env.WHATSAPP_TEMPLATE_NAME,
-        TEMPLATE_LANG: process.env.WHATSAPP_TEMPLATE_LANG || 'ar',
-        VERIFY_TOKEN: process.env.VERIFY_TOKEN
-    },
-    SHEETS: {
-        ID: '1coOeDXKCqgDLVrHBAwtIQ8hsDJQPED3oL1Jp-Ad7jmk'
-    },
-    FILES: {
-        STATE: path.resolve(process.cwd(), 'bot_state.json')
-    }
+  port: Number(optionalEnv('PORT', 10000)),
+  stateFile: path.resolve(process.cwd(), optionalEnv('STATE_FILE', 'bot_state.json')),
+  telegram: {
+    token: env('TELEGRAM_TOKEN'),
+    chatId: env('TELEGRAM_CHAT_ID'),
+    webhookDomain: optionalEnv('TELEGRAM_WEBHOOK_DOMAIN'),
+    webhookPath: optionalEnv('TELEGRAM_WEBHOOK_PATH', '/telegram'),
+  },
+  whatsapp: {
+    token: env('WHATSAPP_TOKEN'),
+    phoneNumberId: env('PHONE_NUMBER_ID'),
+    verifyToken: env('VERIFY_TOKEN'),
+    templateName: optionalEnv('WHATSAPP_TEMPLATE_NAME'),
+    templateLang: optionalEnv('WHATSAPP_TEMPLATE_LANG', 'ar'),
+    apiVersion: optionalEnv('WHATSAPP_API_VERSION', 'v20.0'),
+  },
+  sheets: {
+    id: env('SHEET_ID'),
+    range: optionalEnv('SHEET_RANGE', 'Sheet1!A:C'),
+    email: env('GOOGLE_EMAIL'),
+    key: env('GOOGLE_KEY').replace(/\\n/g, '\n'),
+  },
 };
 
-const bot = new Telegraf(CONFIG.TELEGRAM.TOKEN);
-
-// إعداد Google Sheets
-const GOOGLE_KEY = process.env.GOOGLE_KEY.replace(/\\n/g, '\n');
-const auth = new google.auth.JWT(process.env.GOOGLE_EMAIL, null, GOOGLE_KEY, ['https://www.googleapis.com/auth/spreadsheets']);
-const sheets = google.sheets({ version: 'v4', auth });
-
-// ==========================================
-// إدارة الحالة والذاكرة (State Management)
-// ==========================================
-// نستخدم الذاكرة للسرعة، ونحفظ في ملف للحماية من إعادة التشغيل
-const state = {
-    topicCache: new Map(),        // Phone -> TopicID
-    reverseTopicCache: new Map(), // TopicID -> Phone
-    inFlightTopics: new Map(),    // منع ازدواجية إنشاء الغرف
-    sentMessages: new Map(),      // تتبع الرسائل المرسلة: MessageID -> {topicId, phone, timestamp}
-    outgoingStore: new Map(),     // تخزين نص الرسائل لإعادة الإرسال: MessageID -> {phone, body, ...}
-    names: new Map()              // Phone -> Name
+const logger = {
+  info: (...args) => console.log('[info]', ...args),
+  warn: (...args) => console.warn('[warn]', ...args),
+  error: (...args) => console.error('[error]', ...args),
 };
 
-// حفظ الحالة محلياً (نسخ احتياطي)
-function saveStateToDisk() {
-    try {
-        const payload = {
-            sentMessages: Array.from(state.sentMessages.entries()),
-            outgoingStore: Array.from(state.outgoingStore.entries())
-        };
-        fs.writeFileSync(CONFIG.FILES.STATE, JSON.stringify(payload));
-    } catch (e) {
-        console.error('⚠️ Failed to save state to disk:', e.message);
-    }
-}
+const bot = new Telegraf(CONFIG.telegram.token);
 
-// استعادة الحالة عند البدء
-function loadStateFromDisk() {
-    try {
-        if (fs.existsSync(CONFIG.FILES.STATE)) {
-            const raw = fs.readFileSync(CONFIG.FILES.STATE, 'utf8');
-            const data = JSON.parse(raw);
-            if (data.sentMessages) state.sentMessages = new Map(data.sentMessages);
-            if (data.outgoingStore) state.outgoingStore = new Map(data.outgoingStore);
-            console.log(`✅ State loaded: ${state.sentMessages.size} tracked messages.`);
-        }
-    } catch (e) {
-        console.error('⚠️ Failed to load state:', e.message);
-    }
-}
+const googleAuth = new google.auth.JWT(
+  CONFIG.sheets.email,
+  null,
+  CONFIG.sheets.key,
+  ['https://www.googleapis.com/auth/spreadsheets'],
+);
+const sheets = google.sheets({ version: 'v4', auth: googleAuth });
 
-// تنظيف دوري للبيانات القديمة
-setInterval(() => {
-    const now = Date.now();
-    const day = 24 * 60 * 60 * 1000;
-    let changed = false;
-
-    for (const [id, data] of state.sentMessages) {
-        if (now - data.createdAt > day) {
-            state.sentMessages.delete(id);
-            changed = true;
-        }
-    }
-    for (const [id, data] of state.outgoingStore) {
-        if (now - data.createdAt > day) {
-            state.outgoingStore.delete(id);
-            changed = true;
-        }
-    }
-    if (changed) saveStateToDisk();
-}, 60 * 60 * 1000); // كل ساعة
-
-// ==========================================
-// أدوات مساعدة (Helpers)
-// ==========================================
-const normalizePhone = (phone) => {
-    const raw = (phone || '').toString().trim();
-    if (!raw) return '';
-    const hasPlus = raw.startsWith('+');
-    const digits = raw.replace(/[^\d]/g, '');
-    return digits ? (hasPlus ? `+${digits}` : digits) : '';
-};
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const formatWhatsAppError = (errorData) => {
-    if (!errorData) return 'Unknown Error';
-    const err = errorData.error || {};
-    return [
-        err.code && `Code: ${err.code}`,
-        err.message && `Msg: ${err.message}`,
-        err.error_data?.details && `Details: ${err.error_data.details}`
-    ].filter(Boolean).join(' | ');
-};
-
-function updateCache(phone, topicId, name) {
-    if (phone && topicId) {
-        state.topicCache.set(phone, topicId.toString());
-        state.reverseTopicCache.set(topicId.toString(), phone);
-    }
-    if (phone && name) {
-        state.names.set(phone, name);
-    }
-}
-
-// ==========================================
-// خدمات Google Sheets
-// ==========================================
-async function syncSheetsToMemory() {
-    console.log('🔄 Syncing data from Google Sheets...');
-    try {
-        const res = await sheets.spreadsheets.values.get({
-            spreadsheetId: CONFIG.SHEETS.ID,
-            range: 'Sheet1!A:C'
-        });
-        const rows = res.data.values || [];
-        let count = 0;
-        rows.forEach(row => {
-            const phone = normalizePhone(row[0]);
-            const topicId = row[1]?.toString();
-            const name = row[2]?.toString();
-            if (phone) {
-                updateCache(phone, topicId, name);
-                count++;
-            }
-        });
-        console.log(`✅ Synced ${count} records from Sheets.`);
-        return true;
-    } catch (e) {
-        console.error('❌ Sheet Sync Error:', e.message);
-        return false;
-    }
-}
-
-async function startBackgroundSync() {
-    await syncSheetsToMemory();
-    // إعادة المزامنة كل 10 دقائق للتأكد
-    setInterval(syncSheetsToMemory, 10 * 60 * 1000);
-}
-
-// ==========================================
-// خدمات WhatsApp
-// ==========================================
-const waAxios = axios.create({
-    baseURL: `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP.PHONE_ID}`,
-    headers: { Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}` }
+const wa = axios.create({
+  baseURL: `https://graph.facebook.com/${CONFIG.whatsapp.apiVersion}/${CONFIG.whatsapp.phoneNumberId}`,
+  timeout: 30000,
+  headers: { Authorization: `Bearer ${CONFIG.whatsapp.token}` },
 });
 
-// التعامل مع الأخطاء بشكل مركزي
-async function safeWaRequest(method, url, data) {
-    try {
-        const response = await waAxios({ method, url, data });
-        return { ok: true, data: response.data, messageId: response.data?.messages?.[0]?.id };
-    } catch (e) {
-        const errorData = e.response?.data;
-        const status = e.response?.status;
-        console.error(`❌ WA API Error [${status}]:`, formatWhatsAppError(errorData));
-        return { ok: false, status, errorData, errorMessage: formatWhatsAppError(errorData) };
+const state = {
+  topicByPhone: new Map(),
+  phoneByTopic: new Map(),
+  nameByPhone: new Map(),
+  pendingTopicByPhone: new Map(),
+  sentByWaId: new Map(),
+  outgoingByWaId: new Map(),
+  processedInboundIds: new Map(),
+};
+
+const normalizePhone = (phone) => {
+  const raw = String(phone || '').trim();
+  const digits = raw.replace(/[^\d]/g, '');
+  if (!digits) return '';
+  return raw.startsWith('+') ? `+${digits}` : digits;
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const compactError = (data) => {
+  const err = data?.error || data || {};
+  return [
+    err.code && `code=${err.code}`,
+    err.message,
+    err.error_data?.details,
+  ].filter(Boolean).join(' | ') || 'Unknown error';
+};
+
+const rememberTopic = (phone, topicId, name) => {
+  const normalized = normalizePhone(phone);
+  if (normalized && topicId) {
+    const id = String(topicId);
+    state.topicByPhone.set(normalized, id);
+    state.phoneByTopic.set(id, normalized);
+  }
+  if (normalized && name) state.nameByPhone.set(normalized, name);
+};
+
+async function saveState() {
+  const payload = {
+    savedAt: new Date().toISOString(),
+    sentByWaId: [...state.sentByWaId],
+    outgoingByWaId: [...state.outgoingByWaId],
+    processedInboundIds: [...state.processedInboundIds],
+  };
+  await fs.writeFile(CONFIG.stateFile, JSON.stringify(payload, null, 2), 'utf8');
+}
+
+async function loadState() {
+  try {
+    const raw = await fs.readFile(CONFIG.stateFile, 'utf8');
+    const data = JSON.parse(raw);
+    state.sentByWaId = new Map(data.sentByWaId || []);
+    state.outgoingByWaId = new Map(data.outgoingByWaId || []);
+    state.processedInboundIds = new Map(data.processedInboundIds || []);
+    logger.info(`state loaded: ${state.sentByWaId.size} sent messages`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') logger.warn('could not load state:', error.message);
+  }
+}
+
+async function pruneState() {
+  const maxAgeMs = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  let changed = false;
+
+  for (const map of [state.sentByWaId, state.outgoingByWaId, state.processedInboundIds]) {
+    for (const [key, value] of map) {
+      if (now - value.createdAt > maxAgeMs) {
+        map.delete(key);
+        changed = true;
+      }
     }
+  }
+
+  if (changed) await saveState().catch((error) => logger.warn('state save failed:', error.message));
+}
+
+async function syncSheetsToMemory() {
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: CONFIG.sheets.id,
+      range: CONFIG.sheets.range,
+    });
+
+    for (const row of res.data.values || []) {
+      rememberTopic(row[0], row[1], row[2]);
+    }
+
+    logger.info(`sheets synced: ${state.topicByPhone.size} linked phones`);
+    return true;
+  } catch (error) {
+    logger.error('sheets sync failed:', error.message);
+    return false;
+  }
+}
+
+async function waRequest(method, url, data, config = {}) {
+  try {
+    const res = await wa.request({ method, url, data, ...config });
+    return { ok: true, data: res.data, messageId: res.data?.messages?.[0]?.id };
+  } catch (error) {
+    return {
+      ok: false,
+      status: error.response?.status,
+      errorData: error.response?.data,
+      errorMessage: compactError(error.response?.data),
+    };
+  }
 }
 
 async function sendWhatsAppText(phone, body) {
-    return safeWaRequest('POST', '/messages', {
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: phone,
-        type: 'text',
-        text: { body }
-    });
+  return waRequest('POST', '/messages', {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: normalizePhone(phone),
+    type: 'text',
+    text: { preview_url: true, body },
+  });
 }
 
-async function sendWhatsAppTemplate(phone, nameParam, bodyParam) {
-    if (!CONFIG.WHATSAPP.TEMPLATE_NAME) return { ok: false, errorMessage: 'No Template Configured' };
+async function sendWhatsAppTemplate(phone, body) {
+  if (!CONFIG.whatsapp.templateName) {
+    return { ok: false, errorMessage: 'WHATSAPP_TEMPLATE_NAME is not configured' };
+  }
 
-    // Ensure we have a value for the header variable {{1}} even if name is missing
-    const headerText = nameParam || 'مشترك';
-    const bodyText = bodyParam || '...';
-
-    const components = [
-        {
-            type: 'header',
-            parameters: [{ type: 'text', text: headerText }]
-        },
-        {
-            type: 'body',
-            parameters: [{ type: 'text', text: bodyText }]
-        }
-    ];
-
-    console.log(`📝 Sending Template [${CONFIG.WHATSAPP.TEMPLATE_NAME}] to ${phone}`);
-    console.log('Variables:', { header: headerText, body: bodyText });
-
-    return safeWaRequest('POST', '/messages', {
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: phone,
-        type: 'template',
-        template: {
-            name: CONFIG.WHATSAPP.TEMPLATE_NAME,
-            language: { code: CONFIG.WHATSAPP.TEMPLATE_LANG },
-            components: components
-        }
-    });
+  return waRequest('POST', '/messages', {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: normalizePhone(phone),
+    type: 'template',
+    template: {
+      name: CONFIG.whatsapp.templateName,
+      language: { code: CONFIG.whatsapp.templateLang },
+      components: [{
+        type: 'body',
+        parameters: [{ type: 'text', text: String(body || '').slice(0, 900) || '...' }],
+      }],
+    },
+  });
 }
 
 async function smartSendWhatsApp(phone, body) {
-    // المحاولة الأولى: نص عادي
-    const attempt1 = await sendWhatsAppText(phone, body);
-    if (attempt1.ok) return { ...attempt1, usedTemplate: false };
+  const textAttempt = await sendWhatsAppText(phone, body);
+  if (textAttempt.ok) return { ...textAttempt, usedTemplate: false };
 
-    // إذا فشل بسبب انتهاء الجلسة (131047)، نستخدم القالب
-    const isSessionExpired = attempt1.errorData?.error?.code === 131047 ||
-        (attempt1.errorData?.error?.message || '').includes('outside the allowed window');
+  const code = textAttempt.errorData?.error?.code;
+  const message = textAttempt.errorData?.error?.message || '';
+  const outsideWindow = code === 131047 || message.includes('outside the allowed window');
 
-    if (isSessionExpired) {
-        console.log(`⚠️ Session expired for ${phone}, trying template...`);
-        const name = state.names.get(phone) || '';
+  if (!outsideWindow) return textAttempt;
 
-        // Remove excessive newlines just to be safe, but keep basic structure
-        // Meta sometimes rejects body parameters with too many newlines or complex logic
-        let cleanBody = body.replace(/\n\s*\n/g, '\n').trim();
-
-        const attempt2 = await sendWhatsAppTemplate(phone, name, cleanBody);
-        return { ...attempt2, usedTemplate: true };
-    }
-
-    return attempt1;
+  logger.warn(`session expired for ${phone}; trying template`);
+  const templateAttempt = await sendWhatsAppTemplate(phone, body);
+  return { ...templateAttempt, usedTemplate: true };
 }
 
-// تحميل و إرسال ميديا من تيليجرام إلى واتساب
-async function uploadAndSendMedia(phone, buffer, mimeType, filename, mediaType) {
-    try {
-        // 1. Upload
-        const form = new FormData();
-        form.append('messaging_product', 'whatsapp');
-        form.append('file', buffer, { filename: filename || 'file', contentType: mimeType });
-        if (mimeType) form.append('type', mimeType);
-
-        const uploadRes = await axios.post(
-            `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP.PHONE_ID}/media`,
-            form,
-            { headers: { Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}`, ...form.getHeaders() } }
-        );
-        const mediaId = uploadRes.data?.id;
-        if (!mediaId) throw new Error('No media ID returned');
-
-        // 2. Send
-        const payload = {
-            messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: phone,
-            type: mediaType,
-            [mediaType]: { id: mediaId }
-        };
-        if (mediaType === 'document' && filename) payload.document.filename = filename;
-
-        return safeWaRequest('POST', '/messages', payload);
-
-    } catch (e) {
-        console.error('Media Send Failed:', e.message);
-        return { ok: false, errorMessage: e.message };
-    }
-}
-
-// دالة مساعدة لتحميل ميديا من واتساب وإرسالها لتيليجرام
-async function relayMediaToTelegram(message, topicId, phone) {
-    try {
-        const supportedTypes = ['image', 'video', 'audio', 'document', 'voice', 'sticker'];
-        const mediaType = supportedTypes.find(t => message[t]);
-
-        // ============================
-        // Handle Location
-        // ============================
-        if (message.location) {
-            const { latitude, longitude, name, address } = message.location;
-            console.log(`📍 Location from ${phone}`);
-
-            // Telegram 'sendLocation' doesn't easily support captions or inside topics perfectly with simple interface sometimes, but let's try.
-            try {
-                // Send specific location
-                await bot.telegram.sendLocation(CONFIG.TELEGRAM.CHAT_ID, latitude, longitude, {
-                    message_thread_id: topicId,
-                    horizontal_accuracy: message.location.accuracy
-                });
-                // If there is name/address, send as text context
-                if (name || address) {
-                    await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📍 ${name || ''}\n${address || ''}`, { message_thread_id: topicId });
-                }
-            } catch (locErr) {
-                // Fallback to text link
-                const mapLink = `https://maps.google.com/?q=${latitude},${longitude}`;
-                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📍 موقع من ${phone}:\n${mapLink}`, { message_thread_id: topicId });
-            }
-            return;
-        }
-
-        // ============================
-        // Handle Contacts
-        // ============================
-        if (message.contacts) {
-            console.log(`👤 Contacts from ${phone}`);
-            for (const contact of message.contacts) {
-                const name = contact.name?.formatted_name || 'Unknown';
-                const phones = contact.phones?.map(p => p.phone).join(', ') || 'No number';
-                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `👤 جهة اتصال من ${phone}:\nالاسم: ${name}\nالرقم: ${phones}`, { message_thread_id: topicId });
-            }
-            return;
-        }
-
-        // ============================
-        // Handle Button
-        // ============================
-        if (message.type === 'button' || message.button) {
-            const btnText = message.button?.text || message.button?.payload || 'زر غير معروف';
-            console.log(`🔘 Button response from ${phone}: ${btnText}`);
-            await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: [زر] ${btnText}`, { message_thread_id: topicId });
-            return;
-        }
-
-        // ============================
-        // Handle Unknown/Unsupported
-        // ============================
-        if (!mediaType) {
-            console.log(`⚠️ Unsupported media type from ${phone}:`, JSON.stringify(message, null, 2));
-            // Don't just say "Unsupported", try to give raw info if possible or specific error.
-            if (message.interactive) {
-                const type = message.interactive.type; // button_reply, list_reply
-                let text = '[تفاعل]';
-                if (type === 'button_reply') text = `[زر] ${message.interactive.button_reply.title}`;
-                if (type === 'list_reply') text = `[قائمة] ${message.interactive.list_reply.title}`;
-
-                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: ${text}`, { message_thread_id: topicId });
-                return;
-            }
-
-            await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}: [مرفق غير مدعوم - راجع السجل]`, { message_thread_id: topicId });
-            return;
-        }
-
-        // ============================
-        // Handle Supported Media
-        // ============================
-        const mediaItem = message[mediaType];
-        const mediaId = mediaItem.id;
-
-        console.log(`📥 Downloading ${mediaType} from ${phone}...`);
-
-        // 1. Get Media URL
-        const mediaUrlRes = await axios.get(
-            `https://graph.facebook.com/v20.0/${mediaId}`,
-            { headers: { Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}` } }
-        );
-        const mediaUrl = mediaUrlRes.data?.url;
-
-        if (!mediaUrl) throw new Error('Failed to get media URL');
-
-        // 2. Download Media Blob
-        const fileRes = await axios.get(mediaUrl, {
-            responseType: 'arraybuffer',
-            headers: {
-                Authorization: `Bearer ${CONFIG.WHATSAPP.TOKEN}`,
-                'User-Agent': 'WhatsApp-Telegram-Bridge/1.0'
-            }
-        });
-
-        const fileBuffer = Buffer.from(fileRes.data);
-        const caption = message.caption || `وصل ملف (${mediaType}) من ${phone}`;
-
-        // 3. Send to Telegram
-        const telegramMethods = {
-            image: 'sendPhoto',
-            video: 'sendVideo',
-            audio: 'sendAudio',
-            voice: 'sendVoice',
-            document: 'sendDocument',
-            sticker: 'sendSticker'
-        };
-
-        const method = telegramMethods[mediaType];
-
-        const filePayload = { source: fileBuffer };
-        if (mediaType === 'document' && mediaItem.filename) {
-            filePayload.filename = mediaItem.filename;
-        } else if (mediaType === 'document') {
-            // Try to guess extension or default
-            const mime = mediaItem.mime_type || 'application/octet-stream';
-            const ext = mime.split('/')[1] || 'bin';
-            filePayload.filename = `file_${Date.now()}.${ext}`;
-        }
-
-        const options = { message_thread_id: topicId };
-
-        if (mediaType !== 'sticker' && mediaType !== 'voice') {
-            options.caption = caption;
-        }
-
-        try {
-            await bot.telegram[method](CONFIG.TELEGRAM.CHAT_ID, filePayload, options);
-            console.log(`✅ Relayed ${mediaType} to Telegram topic ${topicId}`);
-        } catch (sendErr) {
-            // Fallback for document if photo/video fails (sometimes compression issues)
-            console.warn(`⚠️ Failed to send as ${mediaType}, trying as document...`, sendErr.message);
-            await bot.telegram.sendDocument(CONFIG.TELEGRAM.CHAT_ID, filePayload, { message_thread_id: topicId, caption: caption });
-        }
-
-    } catch (e) {
-        console.error('❌ Failed to relay media to Telegram:', e.message);
-        await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `⚠️ فشل استلام ملف من ${phone}: ${e.message}`, { message_thread_id: topicId });
-    }
-}
-
-
-// ==========================================
-// منطق الغرف والربط (Topic & Linking Logic)
-// ==========================================
 async function getOrCreateTopic(phone) {
-    const normalized = normalizePhone(phone);
-    if (!normalized) return null;
+  const normalized = normalizePhone(phone);
+  if (!normalized) return null;
+  if (state.topicByPhone.has(normalized)) return state.topicByPhone.get(normalized);
+  if (state.pendingTopicByPhone.has(normalized)) return state.pendingTopicByPhone.get(normalized);
 
-    // 1. Check Memory Cache
-    if (state.topicCache.has(normalized)) return state.topicCache.get(normalized);
+  const task = (async () => {
+    try {
+      const topic = await bot.telegram.createForumTopic(
+        CONFIG.telegram.chatId,
+        `WhatsApp: ${normalized}`,
+      );
+      const topicId = String(topic.message_thread_id);
 
-    // 2. Check In-Flight (Debounce)
-    if (state.inFlightTopics.has(normalized)) return state.inFlightTopics.get(normalized);
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: CONFIG.sheets.id,
+        range: 'Sheet1!A:C',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [[normalized, topicId, '']] },
+      });
 
-    const task = (async () => {
-        try {
-            // 3. Optional: Double check sheet before creating (redundant if sync works but safe)
-            // Not modifying here to keep it fast, relying on bot.on message sync fallback.
+      rememberTopic(normalized, topicId);
+      return topicId;
+    } catch (error) {
+      logger.error('topic creation failed:', error.message);
+      return null;
+    } finally {
+      state.pendingTopicByPhone.delete(normalized);
+    }
+  })();
 
-            const topic = await bot.telegram.createForumTopic(CONFIG.TELEGRAM.CHAT_ID, `الجار: ${normalized}`);
-            const topicId = topic.message_thread_id.toString();
-
-            // Save to Sheet
-            await sheets.spreadsheets.values.append({
-                spreadsheetId: CONFIG.SHEETS.ID,
-                range: 'Sheet1!A:B',
-                valueInputOption: 'USER_ENTERED',
-                resource: { values: [[normalized, topicId]] }
-            });
-
-            updateCache(normalized, topicId);
-            return topicId;
-        } catch (e) {
-            console.error('❌ Topic Creation Error:', e.message);
-            return null;
-        } finally {
-            state.inFlightTopics.delete(normalized);
-        }
-    })();
-
-    state.inFlightTopics.set(normalized, task);
-    return task;
+  state.pendingTopicByPhone.set(normalized, task);
+  return task;
 }
 
-// ==========================================
-// Webhook Handlers
-// ==========================================
-app.post('/webhook', async (req, res) => {
-    res.sendStatus(200); // رد سريع لتجنب Timeout من فيسبوك
+async function sendTelegramMessage(topicId, text) {
+  return bot.telegram.sendMessage(CONFIG.telegram.chatId, text, {
+    message_thread_id: Number(topicId),
+    disable_web_page_preview: false,
+  });
+}
 
-    const change = req.body.entry?.[0]?.changes?.[0]?.value;
-    if (!change) return;
+async function markWhatsAppRead(messageId) {
+  await waRequest('POST', '/messages', {
+    messaging_product: 'whatsapp',
+    status: 'read',
+    message_id: messageId,
+  });
+}
 
-    // 1. معالجة تحديثات الحالة (Delivered, Read, Failed)
-    if (change.statuses) {
-        for (const status of change.statuses) {
-            const stored = state.sentMessages.get(status.id);
-            if (!stored) continue;
+async function relayWhatsAppMediaToTelegram(message, topicId, phone) {
+  if (message.location) {
+    const { latitude, longitude, name, address } = message.location;
+    await bot.telegram.sendLocation(CONFIG.telegram.chatId, latitude, longitude, {
+      message_thread_id: Number(topicId),
+    });
+    if (name || address) await sendTelegramMessage(topicId, `موقع من ${phone}\n${name || ''}\n${address || ''}`.trim());
+    return;
+  }
 
-            const topicId = stored.topicId;
-            let logMsg = '';
-
-            if (status.status === 'read') {
-                logMsg = '✅ تمت القراءة';
-            } else if (status.status === 'failed') {
-                const errText = formatWhatsAppError({ error: status.errors?.[0] });
-                logMsg = `❌ فشل الإرسال: ${errText}`;
-
-                // محاولة إعادة الإرسال الذكي إذا كان الخطأ 131047
-                const original = state.outgoingStore.get(status.id);
-                if (status.errors?.[0]?.code === 131047 && original && !original.usedTemplate) {
-                    console.log(`🔄 Auto-retrying with template for ${original.phone}`);
-                    const retry = await smartSendWhatsApp(original.phone, original.body);
-                    if (retry.ok) {
-                        // تحديث السجل بالرسالة الجديدة
-                        state.sentMessages.set(retry.messageId, { topicId, phone: original.phone, createdAt: Date.now() });
-                        logMsg = '⚠️ فشلت الرسالة العادية، تم إعادة الإرسال بالقالب تلقائياً ✅';
-                    }
-                }
-            }
-
-            if (logMsg && topicId) {
-                try {
-                    // Check if topic exists before sending status, but usually fire and forget is fine here.
-                    await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, logMsg, { message_thread_id: topicId });
-                } catch (e) { /* ignore topic deleted errors here mostly */ }
-            }
-        }
-        return;
+  if (message.contacts) {
+    for (const contact of message.contacts) {
+      const name = contact.name?.formatted_name || 'غير معروف';
+      const phones = contact.phones?.map((item) => item.phone).join(', ') || 'لا يوجد رقم';
+      await sendTelegramMessage(topicId, `جهة اتصال من ${phone}\nالاسم: ${name}\nالرقم: ${phones}`);
     }
+    return;
+  }
 
-    // 2. معالجة الرسائل الواردة
-    const message = change.messages?.[0];
-    if (message) {
-        const phone = normalizePhone(message.from);
-        const topicId = await getOrCreateTopic(phone);
+  if (message.interactive) {
+    const reply = message.interactive.button_reply || message.interactive.list_reply;
+    await sendTelegramMessage(topicId, `${phone}: ${reply?.title || 'تفاعل غير معروف'}`);
+    return;
+  }
 
-        // Mark as Read immediately
-        safeWaRequest('POST', '/messages', {
-            messaging_product: 'whatsapp', status: 'read', message_id: message.id
-        });
+  const type = ['image', 'video', 'audio', 'voice', 'document', 'sticker'].find((key) => message[key]);
+  if (!type) {
+    await sendTelegramMessage(topicId, `${phone}: نوع رسالة غير مدعوم (${message.type || 'unknown'})`);
+    return;
+  }
 
-        if (!topicId) return;
+  const item = message[type];
+  const mediaMeta = await axios.get(`https://graph.facebook.com/${CONFIG.whatsapp.apiVersion}/${item.id}`, {
+    headers: { Authorization: `Bearer ${CONFIG.whatsapp.token}` },
+    timeout: 30000,
+  });
+  const mediaUrl = mediaMeta.data?.url;
+  if (!mediaUrl) throw new Error('WhatsApp media URL is missing');
 
-        try {
-            if (message.text) {
-                await bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📩 ${phone}:\n${message.text.body}`, { message_thread_id: topicId });
-            } else {
-                // التعامل مع الميديا المطور/الموقع/جهات الاتصال واستدعاء الدالة الجديدة
-                await relayMediaToTelegram(message, topicId, phone);
-            }
-        } catch (e) {
-            console.error('❌ Failed to relay to Telegram:', e.message);
-            // إذا كانت الغرفة محذوفة، ننشئ واحدة جديدة المرة القادمة
-            if (e.message.includes('TOPIC_DELETED')) {
-                state.topicCache.delete(phone);
-            }
-        }
+  const fileRes = await axios.get(mediaUrl, {
+    responseType: 'arraybuffer',
+    timeout: 60000,
+    headers: { Authorization: `Bearer ${CONFIG.whatsapp.token}` },
+  });
+
+  const file = {
+    source: Buffer.from(fileRes.data),
+    filename: item.filename || `whatsapp-${Date.now()}`,
+  };
+  const caption = item.caption || message.caption || `ملف من ${phone}`;
+  const options = { message_thread_id: Number(topicId), caption };
+
+  const methods = {
+    image: 'sendPhoto',
+    video: 'sendVideo',
+    audio: 'sendAudio',
+    voice: 'sendVoice',
+    document: 'sendDocument',
+    sticker: 'sendSticker',
+  };
+
+  try {
+    await bot.telegram[methods[type]](CONFIG.telegram.chatId, file, options);
+  } catch (error) {
+    logger.warn(`telegram ${type} send failed; falling back to document:`, error.message);
+    await bot.telegram.sendDocument(CONFIG.telegram.chatId, file, options);
+  }
+}
+
+async function uploadAndSendTelegramMediaToWhatsApp(phone, file, mediaType) {
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append('file', file.buffer, {
+    filename: file.filename,
+    contentType: file.mimeType || 'application/octet-stream',
+  });
+
+  const upload = await axios.post(
+    `https://graph.facebook.com/${CONFIG.whatsapp.apiVersion}/${CONFIG.whatsapp.phoneNumberId}/media`,
+    form,
+    {
+      timeout: 60000,
+      headers: { Authorization: `Bearer ${CONFIG.whatsapp.token}`, ...form.getHeaders() },
+    },
+  );
+
+  const mediaId = upload.data?.id;
+  if (!mediaId) return { ok: false, errorMessage: 'WhatsApp did not return a media id' };
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: normalizePhone(phone),
+    type: mediaType,
+    [mediaType]: { id: mediaId },
+  };
+  if (mediaType === 'document') payload.document.filename = file.filename;
+
+  return waRequest('POST', '/messages', payload);
+}
+
+async function handleWhatsAppStatus(status) {
+  const stored = state.sentByWaId.get(status.id);
+  if (!stored) return;
+
+  if (status.status === 'read') {
+    await sendTelegramMessage(stored.topicId, 'تمت قراءة الرسالة');
+    return;
+  }
+
+  if (status.status !== 'failed') return;
+
+  const errorText = compactError(status.errors?.[0]);
+  const original = state.outgoingByWaId.get(status.id);
+  if (status.errors?.[0]?.code === 131047 && original && !original.usedTemplate) {
+    const retry = await smartSendWhatsApp(original.phone, original.body);
+    if (retry.ok) {
+      state.sentByWaId.set(retry.messageId, {
+        topicId: stored.topicId,
+        phone: original.phone,
+        createdAt: Date.now(),
+      });
+      await saveState();
+      await sendTelegramMessage(stored.topicId, 'فشلت الرسالة العادية وتمت إعادة إرسالها بالقالب');
+      return;
     }
+  }
+
+  await sendTelegramMessage(stored.topicId, `فشل الإرسال: ${errorText}`);
+}
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    linkedPhones: state.topicByPhone.size,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
 });
 
 app.get('/webhook', (req, res) => {
-    if (req.query['hub.verify_token'] === CONFIG.WHATSAPP.VERIFY_TOKEN) res.send(req.query['hub.challenge']);
-    else res.status(403).send('Error');
+  if (req.query['hub.verify_token'] !== CONFIG.whatsapp.verifyToken) {
+    res.status(403).send('Forbidden');
+    return;
+  }
+  res.send(req.query['hub.challenge']);
 });
 
-// ==========================================
-// أوامر البوت (Bot Commands)
-// ==========================================
-bot.command('new', async (ctx) => {
-    const phone = normalizePhone(ctx.message.text.replace('/new', ''));
-    if (!phone) return ctx.reply('الاستخدام: /new 966xxxxxxx');
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
 
-    // Check if exists locally first
-    const existing = state.topicCache.get(phone);
-    if (existing) {
-        return ctx.reply(`يوجد غرفة بالفعل لهذا الرقم: ${existing} \nيمكنك استخدامها مباشرة.`);
+  try {
+    const change = req.body.entry?.[0]?.changes?.[0]?.value;
+    if (!change) return;
+
+    for (const status of change.statuses || []) await handleWhatsAppStatus(status);
+
+    for (const message of change.messages || []) {
+      if (state.processedInboundIds.has(message.id)) continue;
+      state.processedInboundIds.set(message.id, { createdAt: Date.now() });
+
+      const phone = normalizePhone(message.from);
+      const topicId = await getOrCreateTopic(phone);
+      await markWhatsAppRead(message.id);
+      if (!topicId) return;
+
+      if (message.text?.body) {
+        await sendTelegramMessage(topicId, `${phone}:\n${message.text.body}`);
+      } else {
+        await relayWhatsAppMediaToTelegram(message, topicId, phone);
+      }
     }
 
-    const topicId = await getOrCreateTopic(phone);
-    if (topicId) ctx.reply(`تم إنشاء الغرفة للرقم ${phone}`);
-    else ctx.reply('فشل إنشاء الغرفة.');
+    await saveState();
+  } catch (error) {
+    logger.error('webhook handling failed:', error.message);
+  }
+});
+
+bot.command('new', async (ctx) => {
+  const phone = normalizePhone(ctx.message.text.replace('/new', ''));
+  if (!phone) return ctx.reply('الاستخدام: /new 966xxxxxxxxx');
+
+  const topicId = await getOrCreateTopic(phone);
+  if (!topicId) return ctx.reply('تعذر إنشاء الغرفة.');
+  return ctx.reply(`تم ربط الرقم ${phone} بالغرفة ${topicId}`);
+});
+
+bot.command('sync', async (ctx) => {
+  const ok = await syncSheetsToMemory();
+  return ctx.reply(ok ? 'تمت المزامنة.' : 'فشلت المزامنة، راجع السجل.');
 });
 
 bot.command('bulk', async (ctx) => {
-    const raw = ctx.message.text.replace('/bulk', '').trim();
-    if (!raw) return ctx.reply('الشكل المطلوب:\n/bulk الرقم1, الرقم2 | الرسالة');
+  const raw = ctx.message.text.replace('/bulk', '').trim();
+  const [numbersText, bodyText] = raw.split('|').map((part) => part?.trim());
+  if (!numbersText || !bodyText) {
+    return ctx.reply('الاستخدام:\n/bulk 966xxxx,966yyyy | نص الرسالة');
+  }
 
-    let [numbersPart, msgPart] = raw.includes('|') ? raw.split('|') : [raw.split('\n').join(','), ''];
-    let message = msgPart ? msgPart.trim() : numbersPart.split('\n')[0]; // fallback logic
+  const phones = [...new Set(numbersText.split(/[\s,]+/).map(normalizePhone).filter(Boolean))];
+  let success = 0;
+  let failed = 0;
 
-    if (raw.includes('|')) {
-        // Strict pipe mode
-        message = msgPart.trim();
+  await ctx.reply(`بدأ إرسال ${phones.length} رسالة.`);
+
+  for (const phone of phones) {
+    const result = await smartSendWhatsApp(phone, bodyText);
+    const topicId = await getOrCreateTopic(phone);
+
+    if (result.ok) {
+      success += 1;
+      state.sentByWaId.set(result.messageId, { topicId, phone, createdAt: Date.now() });
+      state.outgoingByWaId.set(result.messageId, {
+        phone,
+        body: bodyText,
+        usedTemplate: result.usedTemplate,
+        createdAt: Date.now(),
+      });
+      if (topicId) await sendTelegramMessage(topicId, `رسالة جماعية:\n${bodyText}`).catch(() => {});
     } else {
-        const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
-        if (lines.length > 1) {
-            message = lines[0]; // First line is MSG
-            numbersPart = lines.slice(1).join(','); // Rest are numbers
-        }
+      failed += 1;
+      if (topicId) await sendTelegramMessage(topicId, `فشل إرسال جماعي: ${result.errorMessage}`).catch(() => {});
     }
 
-    const numbers = numbersPart.split(/[, \n]+/).map(normalizePhone).filter(Boolean);
-    if (!numbers.length || !message) return ctx.reply('تأكد من كتابة الأرقام والرسالة.');
+    await sleep(500);
+  }
 
-    ctx.reply(`جاري إرسال ${numbers.length} رسالة...`);
-
-    let stats = { success: 0, failed: 0 };
-
-    // إرسال متتابع بفاصل زمني (Queueing)
-    for (const phone of numbers) {
-        try {
-            const res = await smartSendWhatsApp(phone, message);
-            const topicId = await getOrCreateTopic(phone); // Ensure topic exists for logging
-
-            if (res.ok) {
-                stats.success++;
-                if (topicId) {
-                    state.sentMessages.set(res.messageId, { topicId, phone, createdAt: Date.now() });
-                    bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `📤 رسالة جماعية: ${message}`, { message_thread_id: topicId }).catch(() => { });
-                }
-            } else {
-                stats.failed++;
-                if (topicId) {
-                    bot.telegram.sendMessage(CONFIG.TELEGRAM.CHAT_ID, `❌ فشل جماعي: ${res.errorMessage}`, { message_thread_id: topicId }).catch(() => { });
-                }
-            }
-        } catch (e) {
-            stats.failed++;
-        }
-        await sleep(300); // 300ms delay between sends
-    }
-
-    ctx.reply(`انتهى الإرسال.\n✅ نجاح: ${stats.success}\n❌ فشل: ${stats.failed}`);
-    saveStateToDisk(); // Save state after bulk
-});
-
-// أمر فحص القالب
-bot.command('test_template', async (ctx) => {
-    // Usage: /test_template 966xxxxxx
-    const raw = ctx.message.text.replace('/test_template', '').trim();
-    const phone = normalizePhone(raw);
-
-    if (!phone) return ctx.reply('الاستخدام: /test_template 966xxxxxxxxx');
-
-    ctx.reply(`⏳ جاري تجربة إرسال القالب إلى ${phone}...\nاسم القالب: ${CONFIG.WHATSAPP.TEMPLATE_NAME || 'غير محدد'}\nاللغة: ${CONFIG.WHATSAPP.TEMPLATE_LANG}`);
-
-    // تجربة نص ومتغير رأس
-    const testName = 'تجربة';
-    const testBody = 'هذه رسالة تجريبية للتأكد من عمل القالب بشكل صحيح.';
-
-    const res = await sendWhatsAppTemplate(phone, testName, testBody);
-
-    if (res.ok) {
-        ctx.reply('✅ تم إرسال طلب القالب بنجاح! (Name + Body). تحقق من وصول الرسالة.');
-    } else {
-        ctx.reply(`❌ فشل الإرسال:\n${res.errorMessage}\nCode: ${res.errorData?.error?.code}`);
-        console.error('Test Template Error:', JSON.stringify(res.errorData, null, 2));
-    }
+  await saveState();
+  return ctx.reply(`انتهى الإرسال.\nنجاح: ${success}\nفشل: ${failed}`);
 });
 
 bot.on('message', async (ctx) => {
-    const topicId = ctx.message.message_thread_id?.toString();
-    if (!topicId) return;
+  const topicId = String(ctx.message.message_thread_id || '');
+  if (!topicId || ctx.message.text?.startsWith('/')) return;
 
-    // البحث عن الرقم المرتبط بهذه الغرفة
-    let phone = state.reverseTopicCache.get(topicId);
+  let phone = state.phoneByTopic.get(topicId);
+  if (!phone) {
+    await syncSheetsToMemory();
+    phone = state.phoneByTopic.get(topicId);
+  }
+  if (!phone) return ctx.reply('هذه الغرفة غير مرتبطة برقم واتساب. استخدم /new أولا.');
 
-    // If phone not found in cache, try to resync and check again (Fix for "Room not linked")
-    if (!phone) {
-        console.log(`⚠️ Topic ${topicId} not in cache, attempting sync...`);
-        const synced = await syncSheetsToMemory();
-        if (synced) {
-            phone = state.reverseTopicCache.get(topicId);
-        }
-    }
+  if (ctx.message.text) {
+    const result = await smartSendWhatsApp(phone, ctx.message.text);
+    if (!result.ok) return ctx.reply(`خطأ: ${result.errorMessage}`);
 
-    if (!phone) {
-        // Maybe the user deleted the row from the sheet or something?
-        return ctx.reply('هذه الغرفة غير مرتبطة برقم واتساب (أو لم تتم المزامنة بعد). استخدم /new للإنشاء الصحيح.');
-    }
+    state.sentByWaId.set(result.messageId, { topicId, phone, createdAt: Date.now() });
+    state.outgoingByWaId.set(result.messageId, {
+      phone,
+      body: ctx.message.text,
+      usedTemplate: result.usedTemplate,
+      createdAt: Date.now(),
+    });
+    await saveState();
+    return ctx.reply(result.usedTemplate ? 'تم الإرسال بالقالب.' : 'تم الإرسال.');
+  }
 
-    if (ctx.message.text && !ctx.message.text.startsWith('/')) {
-        const res = await smartSendWhatsApp(phone, ctx.message.text);
-        if (res.ok) {
-            state.sentMessages.set(res.messageId, { topicId, phone, createdAt: Date.now() });
-            state.outgoingStore.set(res.messageId, { phone, body: ctx.message.text, usedTemplate: res.usedTemplate, createdAt: Date.now() });
-            saveStateToDisk();
-            ctx.reply(`✅ ${res.usedTemplate ? 'قالب' : 'تم'}`);
-        } else {
-            ctx.reply(`❌ خطأ: ${res.errorMessage}`);
-        }
-    }
+  const telegramFile =
+    ctx.message.photo?.at(-1) ||
+    ctx.message.video ||
+    ctx.message.document ||
+    ctx.message.voice ||
+    ctx.message.audio;
 
-    // Media Handling (Photo/Video/etc) - Simplified for brevity but functional
-    if (ctx.message.photo || ctx.message.video || ctx.message.document || ctx.message.voice) {
-        const file = ctx.message.photo ? ctx.message.photo.pop() : (ctx.message.video || ctx.message.document || ctx.message.voice);
-        const fileLink = await bot.telegram.getFileLink(file.file_id);
-        const bufferRes = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+  if (!telegramFile) return;
 
-        let type = 'document';
-        if (ctx.message.photo) type = 'image';
-        if (ctx.message.video) type = 'video';
-        if (ctx.message.voice) type = 'audio';
+  const link = await bot.telegram.getFileLink(telegramFile.file_id);
+  const downloaded = await axios.get(link.href, { responseType: 'arraybuffer', timeout: 60000 });
+  const mediaType = ctx.message.photo ? 'image' : ctx.message.video ? 'video' : ctx.message.voice ? 'audio' : 'document';
 
-        const res = await uploadAndSendMedia(phone, Buffer.from(bufferRes.data), file.mime_type, file.file_name || 'file', type);
-        if (res.ok) ctx.reply('✅ ميديا تم');
-        else ctx.reply('❌ ميديا فشل');
-    }
+  const result = await uploadAndSendTelegramMediaToWhatsApp(phone, {
+    buffer: Buffer.from(downloaded.data),
+    filename: telegramFile.file_name || `telegram-${Date.now()}`,
+    mimeType: telegramFile.mime_type,
+  }, mediaType);
+
+  return ctx.reply(result.ok ? 'تم إرسال الملف.' : `فشل إرسال الملف: ${result.errorMessage}`);
 });
 
-// ==========================================
-// التشغيل (Boot)
-// ==========================================
 async function bootstrap() {
-    loadStateFromDisk();
-    await startBackgroundSync();
+  await loadState();
+  await syncSheetsToMemory();
+  setInterval(() => syncSheetsToMemory().catch((error) => logger.warn(error.message)), 10 * 60 * 1000);
+  setInterval(() => pruneState().catch((error) => logger.warn(error.message)), 60 * 60 * 1000);
 
-    if (CONFIG.TELEGRAM.WEBHOOK_DOMAIN) {
-        app.use(bot.webhookCallback(CONFIG.TELEGRAM.WEBHOOK_PATH));
-        await bot.telegram.setWebhook(`${CONFIG.TELEGRAM.WEBHOOK_DOMAIN}${CONFIG.TELEGRAM.WEBHOOK_PATH}`);
-        console.log(`🤖 Telegram Webhook Set: ${CONFIG.TELEGRAM.WEBHOOK_DOMAIN}`);
-    } else {
-        bot.launch();
-        console.log('🤖 Telegram Polling Started');
-    }
+  if (CONFIG.telegram.webhookDomain) {
+    app.use(bot.webhookCallback(CONFIG.telegram.webhookPath));
+    await bot.telegram.setWebhook(`${CONFIG.telegram.webhookDomain}${CONFIG.telegram.webhookPath}`);
+    logger.info(`telegram webhook enabled: ${CONFIG.telegram.webhookDomain}${CONFIG.telegram.webhookPath}`);
+  } else {
+    await bot.launch();
+    logger.info('telegram polling enabled');
+  }
 
-    const PORT = process.env.PORT || 10000;
-    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  app.listen(CONFIG.port, () => logger.info(`server listening on ${CONFIG.port}`));
 }
 
-bootstrap();
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+bootstrap().catch((error) => {
+  logger.error('boot failed:', error.message);
+  process.exit(1);
+});
