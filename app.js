@@ -1,141 +1,100 @@
-      if (!topicId) return;
+const express = require('express');
+const axios = require('axios');
+const { Telegraf } = require('telegraf');
+const FormData = require('form-data');
+const { google } = require('googleapis');
+const fs = require('fs/promises');
+const path = require('path');
 
-      if (message.text?.body) {
-        await sendTelegramMessage(topicId, `${phone}:\n${message.text.body}`);
-      } else {
-        await relayWhatsAppMediaToTelegram(message, topicId, phone);
-      }
-    }
+const app = express();
+app.use(express.json({ limit: '2mb' }));
 
-    await saveState();
-  } catch (error) {
-    logger.error('webhook handling failed:', error.message);
-  }
+const env = (key, fallback = undefined) => {
+  const value = process.env[key] ?? fallback;
+  if (value === undefined || value === '') throw new Error(`Missing env: ${key}`);
+  return value;
+};
+
+const optionalEnv = (key, fallback = undefined) => process.env[key] || fallback;
+
+const CONFIG = {
+  port: Number(optionalEnv('PORT', 10000)),
+  stateFile: path.resolve(process.cwd(), optionalEnv('STATE_FILE', 'bot_state.json')),
+  telegram: {
+    token: env('TELEGRAM_TOKEN'),
+    chatId: env('TELEGRAM_CHAT_ID'),
+    webhookDomain: optionalEnv('TELEGRAM_WEBHOOK_DOMAIN'),
+    webhookPath: optionalEnv('TELEGRAM_WEBHOOK_PATH', '/telegram'),
+  },
+  whatsapp: {
+    token: env('WHATSAPP_TOKEN'),
+    phoneNumberId: env('PHONE_NUMBER_ID'),
+    verifyToken: env('VERIFY_TOKEN'),
+    templateName: optionalEnv('WHATSAPP_TEMPLATE_NAME'),
+    templateLang: optionalEnv('WHATSAPP_TEMPLATE_LANG', 'ar'),
+    apiVersion: optionalEnv('WHATSAPP_API_VERSION', 'v20.0'),
+  },
+  sheets: {
+    id: env('SHEET_ID'),
+    range: optionalEnv('SHEET_RANGE', 'Sheet1!A:C'),
+    email: env('GOOGLE_EMAIL'),
+    key: env('GOOGLE_KEY').replace(/\\n/g, '\n'),
+  },
+};
+
+const logger = {
+  info: (...args) => console.log('[info]', ...args),
+  warn: (...args) => console.warn('[warn]', ...args),
+  error: (...args) => console.error('[error]', ...args),
+};
+
+const bot = new Telegraf(CONFIG.telegram.token);
+
+const googleAuth = new google.auth.JWT(
+  CONFIG.sheets.email,
+  null,
+  CONFIG.sheets.key,
+  ['https://www.googleapis.com/auth/spreadsheets'],
+);
+const sheets = google.sheets({ version: 'v4', auth: googleAuth });
+
+const wa = axios.create({
+  baseURL: `https://graph.facebook.com/${CONFIG.whatsapp.apiVersion}/${CONFIG.whatsapp.phoneNumberId}`,
+  timeout: 30000,
+  headers: { Authorization: `Bearer ${CONFIG.whatsapp.token}` },
 });
 
-bot.command('new', async (ctx) => {
-  const phone = normalizePhone(ctx.message.text.replace('/new', ''));
-  if (!phone) return ctx.reply('الاستخدام: /new 966xxxxxxxxx');
+const state = {
+  topicByPhone: new Map(),
+  phoneByTopic: new Map(),
+  nameByPhone: new Map(),
+  pendingTopicByPhone: new Map(),
+  sentByWaId: new Map(),
+  outgoingByWaId: new Map(),
+  processedInboundIds: new Map(),
+};
 
-  const topicId = await getOrCreateTopic(phone);
-  if (!topicId) return ctx.reply('تعذر إنشاء الغرفة.');
-  return ctx.reply(`تم ربط الرقم ${phone} بالغرفة ${topicId}`);
-});
+const normalizePhone = (phone) => {
+  const raw = String(phone || '').trim();
+  const digits = raw.replace(/[^\d]/g, '');
+  if (!digits) return '';
+  return raw.startsWith('+') ? `+${digits}` : digits;
+};
 
-bot.command('sync', async (ctx) => {
-  const ok = await syncSheetsToMemory();
-  return ctx.reply(ok ? 'تمت المزامنة.' : 'فشلت المزامنة، راجع السجل.');
-});
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-bot.command('bulk', async (ctx) => {
-  const raw = ctx.message.text.replace('/bulk', '').trim();
-  const [numbersText, bodyText] = raw.split('|').map((part) => part?.trim());
-  if (!numbersText || !bodyText) {
-    return ctx.reply('الاستخدام:\n/bulk 966xxxx,966yyyy | نص الرسالة');
-  }
+const compactError = (data) => {
+  const err = data?.error || data || {};
+  return [
+    err.code && `code=${err.code}`,
+    err.message,
+    err.error_data?.details,
+  ].filter(Boolean).join(' | ') || 'Unknown error';
+};
 
-  const phones = [...new Set(numbersText.split(/[\s,]+/).map(normalizePhone).filter(Boolean))];
-  let success = 0;
-  let failed = 0;
-
-  await ctx.reply(`بدأ إرسال ${phones.length} رسالة.`);
-
-  for (const phone of phones) {
-    const result = await smartSendWhatsApp(phone, bodyText);
-    const topicId = await getOrCreateTopic(phone);
-
-    if (result.ok) {
-      success += 1;
-      state.sentByWaId.set(result.messageId, { topicId, phone, createdAt: Date.now() });
-      state.outgoingByWaId.set(result.messageId, {
-        phone,
-        body: bodyText,
-        usedTemplate: result.usedTemplate,
-        createdAt: Date.now(),
-      });
-      if (topicId) await sendTelegramMessage(topicId, `رسالة جماعية:\n${bodyText}`).catch(() => {});
-    } else {
-      failed += 1;
-      if (topicId) await sendTelegramMessage(topicId, `فشل إرسال جماعي: ${result.errorMessage}`).catch(() => {});
-    }
-
-    await sleep(500);
-  }
-
-  await saveState();
-  return ctx.reply(`انتهى الإرسال.\nنجاح: ${success}\nفشل: ${failed}`);
-});
-
-bot.on('message', async (ctx) => {
-  const topicId = String(ctx.message.message_thread_id || '');
-  if (!topicId || ctx.message.text?.startsWith('/')) return;
-
-  let phone = state.phoneByTopic.get(topicId);
-  if (!phone) {
-    await syncSheetsToMemory();
-    phone = state.phoneByTopic.get(topicId);
-  }
-  if (!phone) return ctx.reply('هذه الغرفة غير مرتبطة برقم واتساب. استخدم /new أولا.');
-
-  if (ctx.message.text) {
-    const result = await smartSendWhatsApp(phone, ctx.message.text);
-    if (!result.ok) return ctx.reply(`خطأ: ${result.errorMessage}`);
-
-    state.sentByWaId.set(result.messageId, { topicId, phone, createdAt: Date.now() });
-    state.outgoingByWaId.set(result.messageId, {
-      phone,
-      body: ctx.message.text,
-      usedTemplate: result.usedTemplate,
-      createdAt: Date.now(),
-    });
-    await saveState();
-    return ctx.reply(result.usedTemplate ? 'تم الإرسال بالقالب.' : 'تم الإرسال.');
-  }
-
-  const telegramFile =
-    ctx.message.photo?.at(-1) ||
-    ctx.message.video ||
-    ctx.message.document ||
-    ctx.message.voice ||
-    ctx.message.audio;
-
-  if (!telegramFile) return;
-
-  const link = await bot.telegram.getFileLink(telegramFile.file_id);
-  const downloaded = await axios.get(link.href, { responseType: 'arraybuffer', timeout: 60000 });
-  const uploadInfo = inferTelegramUpload(ctx, telegramFile);
-
-  const result = await uploadAndSendTelegramMediaToWhatsApp(phone, {
-    buffer: Buffer.from(downloaded.data),
-    filename: uploadInfo.filename,
-    mimeType: uploadInfo.mimeType,
-  }, uploadInfo.mediaType);
-
-  return ctx.reply(result.ok ? 'تم إرسال الملف.' : `فشل إرسال الملف: ${result.errorMessage}`);
-});
-
-async function bootstrap() {
-  await loadState();
-  await syncSheetsToMemory();
-  setInterval(() => syncSheetsToMemory().catch((error) => logger.warn(error.message)), 10 * 60 * 1000);
-  setInterval(() => pruneState().catch((error) => logger.warn(error.message)), 60 * 60 * 1000);
-
-  if (CONFIG.telegram.webhookDomain) {
-    app.use(bot.webhookCallback(CONFIG.telegram.webhookPath));
-    await bot.telegram.setWebhook(`${CONFIG.telegram.webhookDomain}${CONFIG.telegram.webhookPath}`);
-    logger.info(`telegram webhook enabled: ${CONFIG.telegram.webhookDomain}${CONFIG.telegram.webhookPath}`);
-  } else {
-    await bot.launch();
-    logger.info('telegram polling enabled');
-  }
-
-  app.listen(CONFIG.port, () => logger.info(`server listening on ${CONFIG.port}`));
-}
-
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-bootstrap().catch((error) => {
-  logger.error('boot failed:', error.message);
-  process.exit(1);
-});
+const rememberTopic = (phone, topicId, name) => {
+  const normalized = normalizePhone(phone);
+  if (normalized && topicId) {
+    const id = String(topicId);
+    state.topicByPhone.set(normalized, id);
+    state.phoneByTopic.set(id, normalized);
