@@ -32,6 +32,7 @@ const CONFIG = {
     verifyToken: env('VERIFY_TOKEN'),
     templateName: optionalEnv('WHATSAPP_TEMPLATE_NAME'),
     templateLang: optionalEnv('WHATSAPP_TEMPLATE_LANG', 'ar'),
+    templateHasBodyParam: optionalEnv('WHATSAPP_TEMPLATE_HAS_BODY_PARAM', 'true') === 'true',
     apiVersion: optionalEnv('WHATSAPP_API_VERSION', 'v20.0'),
   },
   sheets: {
@@ -72,6 +73,7 @@ const state = {
   sentByWaId: new Map(),
   outgoingByWaId: new Map(),
   processedInboundIds: new Map(),
+  lastInboundAt: new Map(),
 };
 
 const normalizePhone = (phone) => {
@@ -162,6 +164,7 @@ async function saveState() {
     sentByWaId: [...state.sentByWaId],
     outgoingByWaId: [...state.outgoingByWaId],
     processedInboundIds: [...state.processedInboundIds],
+    lastInboundAt: [...state.lastInboundAt],
   };
   await fs.writeFile(CONFIG.stateFile, JSON.stringify(payload, null, 2), 'utf8');
 }
@@ -173,6 +176,7 @@ async function loadState() {
     state.sentByWaId = new Map(data.sentByWaId || []);
     state.outgoingByWaId = new Map(data.outgoingByWaId || []);
     state.processedInboundIds = new Map(data.processedInboundIds || []);
+    state.lastInboundAt = new Map(data.lastInboundAt || []);
     logger.info(`state loaded: ${state.sentByWaId.size} sent messages`);
   } catch (error) {
     if (error.code !== 'ENOENT') logger.warn('could not load state:', error.message);
@@ -244,23 +248,38 @@ async function sendWhatsAppTemplate(phone, body) {
     return { ok: false, errorMessage: 'WHATSAPP_TEMPLATE_NAME is not configured' };
   }
 
+  const template = {
+    name: CONFIG.whatsapp.templateName,
+    language: { code: CONFIG.whatsapp.templateLang },
+  };
+
+  if (CONFIG.whatsapp.templateHasBodyParam) {
+    template.components = [{
+      type: 'body',
+      parameters: [{ type: 'text', text: String(body || '').slice(0, 900) || '...' }],
+    }];
+  }
+
   return waRequest('POST', '/messages', {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
     to: normalizePhone(phone),
     type: 'template',
-    template: {
-      name: CONFIG.whatsapp.templateName,
-      language: { code: CONFIG.whatsapp.templateLang },
-      components: [{
-        type: 'body',
-        parameters: [{ type: 'text', text: String(body || '').slice(0, 900) || '...' }],
-      }],
-    },
+    template,
   });
 }
 
 async function smartSendWhatsApp(phone, body) {
+  const normalized = normalizePhone(phone);
+  const lastInboundAt = state.lastInboundAt.get(normalized) || 0;
+  const sessionIsOpen = Date.now() - lastInboundAt < 24 * 60 * 60 * 1000;
+
+  if (!sessionIsOpen) {
+    logger.info(`no open session for ${normalized}; sending approved template`);
+    const templateAttempt = await sendWhatsAppTemplate(normalized, body);
+    return { ...templateAttempt, usedTemplate: true };
+  }
+
   const textAttempt = await sendWhatsAppText(phone, body);
   if (textAttempt.ok) return { ...textAttempt, usedTemplate: false };
 
@@ -275,7 +294,40 @@ async function smartSendWhatsApp(phone, body) {
   return { ...templateAttempt, usedTemplate: true };
 }
 
-async function getOrCreateTopic(phone) {
+const topicTitle = (phone, name) => {
+  const cleanName = String(name || '').trim();
+  return (cleanName ? `${cleanName} | ${phone}` : `WhatsApp: ${phone}`).slice(0, 128);
+};
+
+async function saveContactName(phone, topicId, name) {
+  const normalized = normalizePhone(phone);
+  const cleanName = String(name || '').trim();
+  if (!normalized || !topicId || !cleanName) return;
+
+  const nameChanged = state.nameByPhone.get(normalized) !== cleanName;
+  state.nameByPhone.set(normalized, cleanName);
+  await bot.telegram.editForumTopic(CONFIG.telegram.chatId, Number(topicId), {
+    name: topicTitle(normalized, cleanName),
+  }).catch((error) => logger.warn('topic rename failed:', error.message));
+
+  if (!nameChanged) return;
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: CONFIG.sheets.id,
+    range: CONFIG.sheets.range,
+  });
+  const rows = response.data.values || [];
+  const rowIndex = rows.findIndex((row) => normalizePhone(row[0]) === normalized);
+  if (rowIndex >= 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: CONFIG.sheets.id,
+      range: `Sheet1!C${rowIndex + 1}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [[cleanName]] },
+    });
+  }
+}
+
+async function getOrCreateTopic(phone, name = '') {
   const normalized = normalizePhone(phone);
   if (!normalized) return null;
   if (state.topicByPhone.has(normalized)) return state.topicByPhone.get(normalized);
@@ -285,7 +337,7 @@ async function getOrCreateTopic(phone) {
     try {
       const topic = await bot.telegram.createForumTopic(
         CONFIG.telegram.chatId,
-        `WhatsApp: ${normalized}`,
+        topicTitle(normalized, name),
       );
       const topicId = String(topic.message_thread_id);
 
@@ -293,10 +345,10 @@ async function getOrCreateTopic(phone) {
         spreadsheetId: CONFIG.sheets.id,
         range: 'Sheet1!A:C',
         valueInputOption: 'USER_ENTERED',
-        resource: { values: [[normalized, topicId, '']] },
+        resource: { values: [[normalized, topicId, name]] },
       });
 
-      rememberTopic(normalized, topicId);
+      rememberTopic(normalized, topicId, name);
       return topicId;
     } catch (error) {
       logger.error('topic creation failed:', error.message);
@@ -352,7 +404,19 @@ async function relayWhatsAppMediaToTelegram(message, topicId, phone) {
 
   if (message.interactive) {
     const reply = message.interactive.button_reply || message.interactive.list_reply;
-    await sendTelegramMessage(topicId, `${phone}: ${reply?.title || 'تفاعل غير معروف'}`);
+    const kind = message.interactive.button_reply ? 'ضغط زر' : 'اختار من القائمة';
+    await sendTelegramMessage(
+      topicId,
+      `👆 ${kind}\nالنص: ${reply?.title || 'غير معروف'}\nالمعرّف: ${reply?.id || 'غير متوفر'}`,
+    );
+    return;
+  }
+
+  if (message.button) {
+    await sendTelegramMessage(
+      topicId,
+      `👆 ضغط زر\nالنص: ${message.button.text || 'غير معروف'}\nالمعرّف: ${message.button.payload || 'غير متوفر'}`,
+    );
     return;
   }
 
@@ -450,11 +514,16 @@ async function handleWhatsAppStatus(status) {
   const errorText = compactError(status.errors?.[0]);
   const original = state.outgoingByWaId.get(status.id);
   if (status.errors?.[0]?.code === 131047 && original && !original.usedTemplate) {
-    const retry = await smartSendWhatsApp(original.phone, original.body);
+    const retry = await sendWhatsAppTemplate(original.phone, original.body);
     if (retry.ok) {
       state.sentByWaId.set(retry.messageId, {
         topicId: stored.topicId,
         phone: original.phone,
+        createdAt: Date.now(),
+      });
+      state.outgoingByWaId.set(retry.messageId, {
+        ...original,
+        usedTemplate: true,
         createdAt: Date.now(),
       });
       await saveState();
@@ -496,9 +565,13 @@ app.post('/webhook', async (req, res) => {
       state.processedInboundIds.set(message.id, { createdAt: Date.now() });
 
       const phone = normalizePhone(message.from);
-      const topicId = await getOrCreateTopic(phone);
+      const displayName = change.contacts?.find((contact) => normalizePhone(contact.wa_id) === phone)
+        ?.profile?.name || '';
+      const topicId = await getOrCreateTopic(phone, displayName);
+      state.lastInboundAt.set(phone, Date.now());
       await markWhatsAppRead(message.id);
       if (!topicId) return;
+      await saveContactName(phone, topicId, displayName);
 
       if (message.text?.body) {
         await sendTelegramMessage(topicId, `${phone}:\n${message.text.body}`);
@@ -520,6 +593,30 @@ bot.command('new', async (ctx) => {
   const topicId = await getOrCreateTopic(phone);
   if (!topicId) return ctx.reply('تعذر إنشاء الغرفة.');
   return ctx.reply(`تم ربط الرقم ${phone} بالغرفة ${topicId}`);
+});
+
+bot.command('link', async (ctx) => {
+  const topicId = String(ctx.message.message_thread_id || '');
+  const phone = normalizePhone(ctx.message.text.replace('/link', ''));
+  if (!topicId) return ctx.reply('استخدم هذا الأمر داخل غرفة جديدة.');
+  if (!phone) return ctx.reply('الاستخدام: /link 966xxxxxxxxx');
+
+  const existingTopic = state.topicByPhone.get(phone);
+  if (existingTopic && existingTopic !== topicId) {
+    return ctx.reply(`هذا الرقم مرتبط مسبقًا بالغرفة ${existingTopic}.`);
+  }
+
+  rememberTopic(phone, topicId);
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: CONFIG.sheets.id,
+    range: 'Sheet1!A:C',
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [[phone, topicId, '']] },
+  });
+  await bot.telegram.editForumTopic(CONFIG.telegram.chatId, Number(topicId), {
+    name: topicTitle(phone),
+  }).catch(() => {});
+  return ctx.reply(`تم ربط هذه الغرفة بالرقم ${phone}. أرسل رسالتك الآن.`);
 });
 
 bot.command('sync', async (ctx) => {
