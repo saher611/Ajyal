@@ -257,10 +257,16 @@ async function sendWhatsAppTemplate(phone, body) {
 
   if (CONFIG.whatsapp.templateHasBodyParam) {
     const count = Math.max(1, CONFIG.whatsapp.templateParamCount);
-    const messageText = String(body || '').slice(0, 900) || '...';
+    const cleanTemplateParam = (value) => String(value || '')
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .slice(0, 900);
+    const messageText = cleanTemplateParam(body) || '...';
+    const firstParam = cleanTemplateParam(CONFIG.whatsapp.templateFirstParam) || 'عميلنا الكريم';
     const values = Array.from(
       { length: count },
-      (_, index) => (index === count - 1 ? messageText : CONFIG.whatsapp.templateFirstParam),
+      (_, index) => (index === count - 1 ? messageText : firstParam),
     );
 
     template.components = [{
@@ -279,16 +285,6 @@ async function sendWhatsAppTemplate(phone, body) {
 }
 
 async function smartSendWhatsApp(phone, body) {
-  const normalized = normalizePhone(phone);
-  const lastInboundAt = state.lastInboundAt.get(normalized) || 0;
-  const sessionIsOpen = Date.now() - lastInboundAt < 24 * 60 * 60 * 1000;
-
-  if (!sessionIsOpen) {
-    logger.info(`no open session for ${normalized}; sending approved template`);
-    const templateAttempt = await sendWhatsAppTemplate(normalized, body);
-    return { ...templateAttempt, usedTemplate: true };
-  }
-
   const textAttempt = await sendWhatsAppText(phone, body);
   if (textAttempt.ok) return { ...textAttempt, usedTemplate: false };
 
@@ -738,8 +734,16 @@ async function bootstrap() {
   app.listen(CONFIG.port, () => logger.info(`server listening on ${CONFIG.port}`));
 }
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+const stopBot = (signal) => {
+  try {
+    bot.stop(signal);
+  } catch (error) {
+    if (error.message !== 'Bot is not running!') logger.warn('bot stop failed:', error.message);
+  }
+};
+
+process.once('SIGINT', () => stopBot('SIGINT'));
+process.once('SIGTERM', () => stopBot('SIGTERM'));
 
 bootstrap().catch((error) => {
   logger.error('boot failed:', error.message);
