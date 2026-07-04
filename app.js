@@ -33,6 +33,8 @@ const CONFIG = {
     templateName: optionalEnv('WHATSAPP_TEMPLATE_NAME'),
     templateLang: optionalEnv('WHATSAPP_TEMPLATE_LANG', 'ar'),
     templateHasBodyParam: optionalEnv('WHATSAPP_TEMPLATE_HAS_BODY_PARAM', 'true') === 'true',
+    templateParamCount: Number(optionalEnv('WHATSAPP_TEMPLATE_PARAM_COUNT', 2)),
+    templateFirstParam: optionalEnv('WHATSAPP_TEMPLATE_FIRST_PARAM', 'عميلنا الكريم'),
     apiVersion: optionalEnv('WHATSAPP_API_VERSION', 'v20.0'),
   },
   sheets: {
@@ -254,9 +256,16 @@ async function sendWhatsAppTemplate(phone, body) {
   };
 
   if (CONFIG.whatsapp.templateHasBodyParam) {
+    const count = Math.max(1, CONFIG.whatsapp.templateParamCount);
+    const messageText = String(body || '').slice(0, 900) || '...';
+    const values = Array.from(
+      { length: count },
+      (_, index) => (index === count - 1 ? messageText : CONFIG.whatsapp.templateFirstParam),
+    );
+
     template.components = [{
       type: 'body',
-      parameters: [{ type: 'text', text: String(body || '').slice(0, 900) || '...' }],
+      parameters: values.map((text) => ({ type: 'text', text })),
     }];
   }
 
