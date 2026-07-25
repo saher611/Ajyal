@@ -558,7 +558,43 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
+app.post('/webhook', async (req, res) => {
+  res.sendStatus(200);
 
+  // ===== Ajyal WhatsApp Relay =====
+  try {
+    const relayUrl = process.env.WA_RELAY_URL;
+    const relaySecret = process.env.WA_RELAY_SECRET;
+
+    if (relayUrl && relaySecret) {
+      axios.post(
+        relayUrl,
+        req.body,
+        {
+          timeout: 15000,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Wa-Relay-Secret': relaySecret,
+          },
+        },
+      )
+        .then((response) => {
+          console.log('[ajyal-relay]', response.status);
+        })
+        .catch((error) => {
+          console.error(
+            '[ajyal-relay]',
+            error.response?.status || '',
+            error.response?.data || error.message,
+          );
+        });
+    }
+  } catch (error) {
+    console.error('[ajyal-relay]', error.message);
+  }
+
+  try {
+    const change = req.body.entry?.[0]?.changes?.[0]?.value;
   try {
     const change = req.body.entry?.[0]?.changes?.[0]?.value;
     if (!change) return;
