@@ -669,6 +669,82 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+
+const mirroredWebsiteMessages = new Map();
+
+app.post('/api/telegram-mirror', async (req, res) => {
+  try {
+    const providedSecret = String(req.headers['x-wa-relay-secret'] || '');
+    const expectedSecret = String(process.env.WA_RELAY_SECRET || '');
+
+    if (!expectedSecret) {
+      return res.status(503).json({ ok: false, error: 'WA_RELAY_SECRET is not configured' });
+    }
+
+    if (!providedSecret || providedSecret !== expectedSecret) {
+      return res.status(401).json({ ok: false, error: 'invalid relay auth' });
+    }
+
+    const {
+      phone,
+      body,
+      whatsapp_message_id: whatsappMessageId,
+      sent_by: sentBy,
+      sent_at: sentAt,
+      type = 'text',
+      media_url: mediaUrl,
+    } = req.body || {};
+
+    const normalizedPhone = normalizePhone(phone);
+    if (!normalizedPhone) {
+      return res.status(400).json({ ok: false, error: 'phone is required' });
+    }
+
+    if (!body && !mediaUrl) {
+      return res.status(400).json({ ok: false, error: 'body or media_url is required' });
+    }
+
+    const dedupeKey = String(
+      whatsappMessageId
+      || `${normalizedPhone}:${sentAt || ''}:${String(body || '').slice(0, 80)}:${mediaUrl || ''}`,
+    );
+
+    if (mirroredWebsiteMessages.has(dedupeKey)) {
+      return res.json({ ok: true, deduped: true });
+    }
+
+    const topicId = await getOrCreateTopic(normalizedPhone);
+    if (!topicId) {
+      return res.status(500).json({ ok: false, error: 'Could not find or create Telegram topic' });
+    }
+
+    const senderPart = sentBy ? ` — ${sentBy}` : '';
+    const lines = [`📤 رد من الموقع${senderPart}`];
+
+    if (body) lines.push(String(body));
+    if (mediaUrl) lines.push(`📎 ${type || 'ملف'}: ${mediaUrl}`);
+    if (sentAt) lines.push(`🕒 ${sentAt}`);
+
+    await sendTelegramMessage(topicId, lines.join('\n'));
+
+    mirroredWebsiteMessages.set(dedupeKey, Date.now());
+
+    const cutoff = Date.now() - (24 * 60 * 60 * 1000);
+    for (const [key, createdAt] of mirroredWebsiteMessages) {
+      if (createdAt < cutoff) mirroredWebsiteMessages.delete(key);
+    }
+
+    return res.json({ ok: true, topicId });
+  } catch (error) {
+    logger.error(
+      '[telegram-mirror]',
+      error.response?.status || '',
+      error.response?.data || error.message,
+    );
+    return res.status(500).json({ ok: false, error: error.message || 'telegram mirror failed' });
+  }
+});
+
 bot.command('new', async (ctx) => {
   const phone = normalizePhone(ctx.message.text.replace('/new', ''));
   if (!phone) return ctx.reply('الاستخدام: /new 966xxxxxxxxx');
@@ -798,9 +874,8 @@ bot.on('message', async (ctx) => {
   }, uploadInfo.mediaType);
 
   if (result.ok) {
-    const caption = ctx.message.caption || `تم إرسال ${uploadInfo.mediaType} من Telegram`;
     await relayTelegramMessageToSite(ctx, phone, {
-      body: caption,
+      body: ctx.message.caption || `تم إرسال ${uploadInfo.mediaType} من Telegram`,
       type: uploadInfo.mediaType,
     });
   }
