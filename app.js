@@ -374,6 +374,52 @@ async function sendTelegramMessage(topicId, text) {
   });
 }
 
+
+async function relayTelegramMessageToSite(ctx, phone, extra = {}) {
+  const relaySecret = process.env.WA_RELAY_SECRET;
+  const relayUrl = process.env.TELEGRAM_INBOUND_URL
+    || 'https://summer.ajyalcouncil.org.sa/api/public/hooks/telegram-inbound';
+
+  if (!relaySecret || !relayUrl || !phone || ctx.from?.is_bot) return;
+
+  const senderName = [ctx.from?.first_name, ctx.from?.last_name]
+    .filter(Boolean)
+    .join(' ')
+    || ctx.from?.username
+    || null;
+
+  const payload = {
+    phone: normalizePhone(phone),
+    body: extra.body || '',
+    telegram_message_id: String(ctx.message?.message_id || ''),
+    sender_name: senderName,
+    sent_at: ctx.message?.date
+      ? new Date(ctx.message.date * 1000).toISOString()
+      : new Date().toISOString(),
+    type: extra.type || 'text',
+    media_url: extra.mediaUrl || null,
+  };
+
+  if (!payload.telegram_message_id || (!payload.body && !payload.media_url)) return;
+
+  try {
+    const response = await axios.post(relayUrl, payload, {
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Wa-Relay-Secret': relaySecret,
+      },
+    });
+    logger.info('[telegram-inbound]', response.status, payload.telegram_message_id);
+  } catch (error) {
+    logger.error(
+      '[telegram-inbound]',
+      error.response?.status || '',
+      error.response?.data || error.message,
+    );
+  }
+}
+
 async function markWhatsAppRead(messageId) {
   await waRequest('POST', '/messages', {
     messaging_product: 'whatsapp',
@@ -702,7 +748,7 @@ bot.command('bulk', async (ctx) => {
 
 bot.on('message', async (ctx) => {
   const topicId = String(ctx.message.message_thread_id || '');
-  if (!topicId || ctx.message.text?.startsWith('/')) return;
+  if (!topicId || ctx.message.text?.startsWith('/') || ctx.from?.is_bot) return;
 
   let phone = state.phoneByTopic.get(topicId);
   if (!phone) {
@@ -723,6 +769,12 @@ bot.on('message', async (ctx) => {
       createdAt: Date.now(),
     });
     await saveState();
+
+    await relayTelegramMessageToSite(ctx, phone, {
+      body: ctx.message.text,
+      type: 'text',
+    });
+
     return ctx.reply(result.usedTemplate ? 'تم الإرسال بالقالب.' : 'تم الإرسال.');
   }
 
@@ -744,6 +796,14 @@ bot.on('message', async (ctx) => {
     filename: uploadInfo.filename,
     mimeType: uploadInfo.mimeType,
   }, uploadInfo.mediaType);
+
+  if (result.ok) {
+    const caption = ctx.message.caption || `تم إرسال ${uploadInfo.mediaType} من Telegram`;
+    await relayTelegramMessageToSite(ctx, phone, {
+      body: caption,
+      type: uploadInfo.mediaType,
+    });
+  }
 
   return ctx.reply(result.ok ? 'تم إرسال الملف.' : `فشل إرسال الملف: ${result.errorMessage}`);
 });
