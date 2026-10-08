@@ -7,7 +7,9 @@ const fs = require('fs/promises');
 const path = require('path');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '2mb', verify: (req, _res, rawBody) => {
+  if (req.path === '/webhook') req.ajyalRawBody = Buffer.from(rawBody);
+} }));
 
 const env = (key, fallback = undefined) => {
   const value = process.env[key] ?? fallback;
@@ -603,7 +605,11 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+  // Acknowledge Meta only after NEW verifies and persists the signed event.
+  // Retry transient failures while retaining OLD Telegram handling.
+  const newDelivery = await forwardSignedMetaWebhookToAjyalNew(req);
+  res.sendStatus(newDelivery.httpStatus);
+  if (newDelivery.rejectLegacy) return;
 
   // ===== Ajyal WhatsApp Relay =====
   try {
@@ -670,6 +676,33 @@ app.post('/webhook', async (req, res) => {
 });
 
 
+async function forwardSignedMetaWebhookToAjyalNew(req) {
+  const signature = String(req.headers['x-hub-signature-256'] || '');
+  if (!/^sha256=[0-9a-f]{64}$/i.test(signature) || !Buffer.isBuffer(req.ajyalRawBody)) {
+    logger.warn('[ajyal-new-relay] rejected unsigned or missing raw body');
+    return { httpStatus: 401, rejectLegacy: true };
+  }
+  // NEW independently verifies HMAC and persists by WhatsApp message ID.
+  const destination = 'https://zcgjsxysodskwxjoxdmb.supabase.co/functions/v1/ajyal-whatsapp-webhook';
+  try {
+    const response = await axios.post(destination, req.ajyalRawBody, {
+      timeout: 3500,
+      headers: { 'Content-Type': 'application/json', 'X-Hub-Signature-256': signature },
+      validateStatus: () => true,
+    });
+    logger.info('[ajyal-new-relay]', response.status);
+    if (response.status >= 200 && response.status < 300) return { httpStatus: 200, rejectLegacy: false };
+    if ([400, 401, 403, 413].includes(response.status)) {
+      logger.warn('[ajyal-new-relay] non-retryable signature/payload reject:', response.status);
+      return { httpStatus: response.status, rejectLegacy: true };
+    }
+    logger.warn('[ajyal-new-relay] transient failure; requesting Meta retry:', response.status);
+    return { httpStatus: 503, rejectLegacy: false };
+  } catch (error) {
+    logger.warn('[ajyal-new-relay] delivery failed; requesting Meta retry:', error.code || 'NETWORK_ERROR');
+    return { httpStatus: 503, rejectLegacy: false };
+  }
+}
 const mirroredWebsiteMessages = new Map();
 
 app.post('/api/telegram-mirror', async (req, res) => {
