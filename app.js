@@ -7,7 +7,9 @@ const fs = require('fs/promises');
 const path = require('path');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '2mb', verify: (req, _res, rawBody) => {
+  if (req.path === '/webhook') req.ajyalRawBody = Buffer.from(rawBody);
+} }));
 
 const env = (key, fallback = undefined) => {
   const value = process.env[key] ?? fallback;
@@ -604,6 +606,8 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
+  // New CRM shadow path does not block the existing OLD Telegram flow.
+  void forwardSignedMetaWebhookToAjyalNew(req);
 
   // ===== Ajyal WhatsApp Relay =====
   try {
@@ -669,6 +673,27 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+
+async function forwardSignedMetaWebhookToAjyalNew(req) {
+  const signature = String(req.headers['x-hub-signature-256'] || '');
+  if (!/^sha256=[0-9a-f]{64}$/i.test(signature) || !Buffer.isBuffer(req.ajyalRawBody)) {
+    logger.warn('[ajyal-new-relay] rejected unsigned or missing raw body');
+    return;
+  }
+  // Server-to-server shadow forwarding only: OLD Telegram bridge remains live.
+  // Ajyal NEW Edge authenticates Meta using HMAC over original unmodified bytes.
+  const destination = 'https://zcgjsxysodskwxjoxdmb.supabase.co/functions/v1/ajyal-whatsapp-webhook';
+  try {
+    const response = await axios.post(destination, req.ajyalRawBody, {
+      timeout: 15000,
+      headers: { 'Content-Type': 'application/json', 'X-Hub-Signature-256': signature },
+      validateStatus: () => true,
+    });
+    logger.info('[ajyal-new-relay]', response.status);
+  } catch (error) {
+    logger.warn('[ajyal-new-relay] delivery failed; OLD bridge unaffected:', error.code || 'NETWORK_ERROR');
+  }
+}
 
 const mirroredWebsiteMessages = new Map();
 
