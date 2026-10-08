@@ -1,0 +1,1 @@
+Temporary Ajyal GitHub connector write-permission check. No production changes.
