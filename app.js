@@ -658,7 +658,7 @@ app.post('/webhook', async (req, res) => {
         ?.profile?.name || '';
       const topicId = await getOrCreateTopic(phone, displayName);
       state.lastInboundAt.set(phone, Date.now());
-      await markWhatsAppRead(message.id);
+      // Receipt/relay is not employee reading. Do not send a Meta read receipt here.
       if (!topicId) return;
       await saveContactName(phone, topicId, displayName);
 
