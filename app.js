@@ -5,10 +5,11 @@ const FormData = require('form-data');
 const { google } = require('googleapis');
 const fs = require('fs/promises');
 const path = require('path');
+const { createTopicBindingHandler, signedJson, outboundImportPayload } = require('./telegram-staff-sync');
 
 const app = express();
 app.use(express.json({ limit: '2mb', verify: (req, _res, rawBody) => {
-  if (req.path === '/webhook') req.ajyalRawBody = Buffer.from(rawBody);
+  if (req.path === '/webhook' || req.path === '/api/telegram-topic-binding') req.ajyalRawBody = Buffer.from(rawBody);
 } }));
 
 const env = (key, fallback = undefined) => {
@@ -422,6 +423,58 @@ async function relayTelegramMessageToSite(ctx, phone, extra = {}) {
   }
 }
 
+async function relayTelegramOutboundImportToStaff(ctx, phone, extra = {}) {
+  const relayUrl = process.env.TELEGRAM_OUTBOUND_IMPORT_URL;
+  const relaySecret = process.env.WA_RELAY_SECRET;
+  if (!relayUrl || !relaySecret || ctx.from?.is_bot) return;
+
+  const payload = outboundImportPayload({
+    ctx,
+    phone,
+    providerMessageId: extra.providerMessageId,
+    type: extra.type,
+    body: extra.body,
+    mediaId: extra.mediaId,
+    mediaMime: extra.mediaMime,
+  });
+  if (!payload) {
+    logger.warn('[telegram-outbound-import] rejected incomplete accepted-message contract');
+    return;
+  }
+
+  const { raw, signature } = signedJson(relaySecret, payload);
+  try {
+    const response = await axios.post(relayUrl, raw, {
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Wa-Relay-Signature': signature,
+      },
+      validateStatus: () => true,
+    });
+    if (response.status >= 200 && response.status < 300) {
+      logger.info('[telegram-outbound-import]', response.status, payload.telegram_message_id);
+    } else {
+      logger.warn('[telegram-outbound-import] rejected:', response.status);
+    }
+  } catch (error) {
+    logger.warn('[telegram-outbound-import] delivery failed:', error.code || 'NETWORK_ERROR');
+  }
+}
+
+async function relayAcceptedTelegramOutbound(ctx, phone, extra = {}) {
+  if (process.env.TELEGRAM_OUTBOUND_IMPORT_ENABLED !== 'true') {
+    return relayTelegramMessageToSite(ctx, phone, extra);
+  }
+  // The Staff importer intentionally rejects template snapshots until their
+  // immutable provider contract is reviewed; do not mislabel one as text.
+  if (extra.usedTemplate) {
+    logger.warn('[telegram-outbound-import] template snapshot contract pending');
+    return;
+  }
+  return relayTelegramOutboundImportToStaff(ctx, phone, extra);
+}
+
 async function markWhatsAppRead(messageId) {
   await waRequest('POST', '/messages', {
     messaging_product: 'whatsapp',
@@ -550,7 +603,8 @@ async function uploadAndSendTelegramMediaToWhatsApp(phone, file, mediaType) {
   };
   if (mediaType === 'document') payload.document.filename = file.filename;
 
-  return waRequest('POST', '/messages', payload);
+  const sent = await waRequest('POST', '/messages', payload);
+  return { ...sent, mediaId, mediaMime: file.mimeType };
 }
 
 async function handleWhatsAppStatus(status) {
@@ -595,6 +649,13 @@ app.get('/health', (req, res) => {
     uptimeSeconds: Math.round(process.uptime()),
   });
 });
+
+app.post('/api/telegram-topic-binding', createTopicBindingHandler({
+  secret: process.env.WA_RELAY_SECRET || '',
+  expectedChatId: CONFIG.telegram.chatId,
+  phoneByTopic: state.phoneByTopic,
+  syncSheetsToMemory,
+}));
 
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] !== CONFIG.whatsapp.verifyToken) {
@@ -879,9 +940,11 @@ bot.on('message', async (ctx) => {
     });
     await saveState();
 
-    await relayTelegramMessageToSite(ctx, phone, {
+    await relayAcceptedTelegramOutbound(ctx, phone, {
       body: ctx.message.text,
       type: 'text',
+      providerMessageId: result.messageId,
+      usedTemplate: result.usedTemplate,
     });
 
     return ctx.reply(result.usedTemplate ? 'تم الإرسال بالقالب.' : 'تم الإرسال.');
@@ -907,9 +970,12 @@ bot.on('message', async (ctx) => {
   }, uploadInfo.mediaType);
 
   if (result.ok) {
-    await relayTelegramMessageToSite(ctx, phone, {
+    await relayAcceptedTelegramOutbound(ctx, phone, {
       body: ctx.message.caption || `تم إرسال ${uploadInfo.mediaType} من Telegram`,
       type: uploadInfo.mediaType,
+      providerMessageId: result.messageId,
+      mediaId: result.mediaId,
+      mediaMime: result.mediaMime,
     });
   }
 
